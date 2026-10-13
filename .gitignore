@@ -1,6 +1,9 @@
 app
 app.exe
+app-wayland
 *.o
+third_party/wayland/*-client-protocol.h
+third_party/wayland/*-protocol.c
 *.png
 *.bmp
 *.jpeg

@@ -372,7 +372,7 @@ int main(void)
     ag_ui_set_layout_cb(g_ui, on_layout, NULL);
     on_layout(g_ui, 820, 560, NULL);        
 
-    const char *photos[] = { "test.jpg", "test.png", NULL };
+    const char *photos[] = { "test.jpg", "test.png", "test.bmp", NULL };
     for (int i = 0; photos[i]; ++i) {
         if (g_img_n >= IMG_LIMIT) break;
         ag_image *im = ag_image_load(photos[i]);

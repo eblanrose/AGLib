@@ -12,6 +12,15 @@
 
 > all what you need to compile is C Compiler and GNU Make!
 
+# Building
+
+```sh
+make            # builds `app` (X11) and `app.exe` (Windows)
+make wayland    # builds `app-wayland` (Wayland)
+make app # builds `app` (X11)
+mape app.exe # builds (Windows)
+```
+
 # Examples
 
 ``` c
@@ -130,7 +139,7 @@ Cleanup
 
 `const char *ag_get_platform(void)`
 
-Returns `"win32"` or `"x11"`
+Returns `"win32"`, `"x11"` or `"wayland"`
 
 `void ag_sleep_ms(unsigned int ms)`
 
