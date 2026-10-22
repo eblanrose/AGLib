@@ -84,12 +84,15 @@ AGAPI void ag_main_loop(void);
 AGAPI void ag_quit(void);             
 
 AGAPI ag_font *ag_font_open(const char *name, unsigned int px);
+AGAPI ag_font *ag_font_open_file(const char *path, unsigned int px);
 AGAPI ag_font *ag_font_default(unsigned int px);
 AGAPI void     ag_font_close(ag_font *f);
 AGAPI int      ag_font_ascent(const ag_font *f);
 AGAPI int      ag_font_descent(const ag_font *f);
 AGAPI int      ag_font_height(const ag_font *f);
 AGAPI int      ag_font_text_width(const ag_font *f, const char *utf8);
+AGAPI const char *ag_font_family(const ag_font *f);
+AGAPI int      ag_font_set_size(ag_font *f, unsigned int px);
 
 
 AGAPI void ag_begin_frame(ag_window *w);
@@ -111,10 +114,18 @@ AGAPI void ag_draw_text (ag_window *w, int x, int y, const char *text);
 AGAPI ag_image *ag_image_load(const char *path);
 AGAPI ag_image *ag_image_load_svg(const char *path, float scale);  
 AGAPI ag_image *ag_image_create(int w, int h);
+AGAPI ag_image *ag_image_clone(const ag_image *img);
 AGAPI void      ag_image_destroy(ag_image *img);
 AGAPI int       ag_image_get_size(const ag_image *img, int *w, int *h);
+AGAPI ag_u32    ag_image_pixel(const ag_image *img, int x, int y);
+AGAPI int       ag_image_save_png(const ag_image *img, const char *path);
 AGAPI void ag_draw_image(ag_window *w, int x, int y, int wc, int hc,
                          const ag_image *img);
+
+AGAPI int  ag_image_blur_dual_kawase(ag_image *img, int radius, int passes);
+AGAPI int  ag_image_blur_box(ag_image *img, int radius, int passes);
+AGAPI void ag_draw_image_blur(ag_window *w, int x, int y, int wc, int hc,
+                              const ag_image *img, int radius, int passes);
 
 typedef void (*ag_widget_cb)(ag_widget *wdg, void *userdata);
 
@@ -169,6 +180,90 @@ AGAPI const char *ag_textview_text(const ag_widget *wdg);
 AGAPI void        ag_textview_clear(ag_widget *wdg);
 AGAPI void        ag_textview_set_scroll(ag_widget *wdg, int line);     
 
+
+#define AG_PAGE_GLOBAL (-1)
+
+typedef enum {
+    AG_ANIM_FADE = 0,
+    AG_ANIM_SLIDE_LEFT,
+    AG_ANIM_SLIDE_RIGHT,
+    AG_ANIM_SLIDE_UP,
+    AG_ANIM_SLIDE_DOWN,
+    AG_ANIM_SCALE,
+    AG_ANIM_FLIP
+} ag_anim_type;
+
+typedef enum {
+    AG_EASE_LINEAR = 0,
+    AG_EASE_IN_QUAD,
+    AG_EASE_OUT_QUAD,
+    AG_EASE_IN_OUT_QUAD,
+    AG_EASE_OUT_CUBIC,
+    AG_EASE_IN_OUT_CUBIC,
+    AG_EASE_OUT_BACK,
+    AG_EASE_OUT_ELASTIC,
+    AG_EASE_OUT_BOUNCE
+} ag_ease;
+
+AGAPI void ag_ui_set_transition(ag_ui *ui, ag_anim_type type,
+                                int duration_ms, ag_ease ease);
+typedef void (*ag_page_draw_cb)(ag_ui *ui, int page, void *userdata);
+AGAPI void ag_ui_set_page_draw_cb(ag_ui *ui, ag_page_draw_cb cb, void *ud);
+AGAPI void ag_ui_set_page(ag_ui *ui, int page);
+AGAPI int  ag_ui_page(const ag_ui *ui);
+AGAPI int  ag_ui_animating(const ag_ui *ui);
+AGAPI void ag_ui_update(ag_ui *ui);
+AGAPI void ag_widget_set_page(ag_widget *wdg, int page);
+AGAPI int  ag_widget_page(const ag_widget *wdg);
+AGAPI void ag_widget_set_anim_delay(ag_widget *wdg, int ms);
+AGAPI float ag_ease_apply(ag_ease ease, float t);
+
+typedef struct ag_video ag_video;
+
+typedef enum {
+    AG_VIDEO_BACKEND_AUTO = 0,
+    AG_VIDEO_BACKEND_AVI,
+    AG_VIDEO_BACKEND_MJPEG,
+    AG_VIDEO_BACKEND_MP4,
+    AG_VIDEO_BACKEND_MKV,
+} ag_video_backend;
+
+AGAPI ag_video   *ag_video_open(const char *path);
+AGAPI ag_video   *ag_video_open_ex(const char *path, ag_video_backend backend);
+AGAPI void        ag_video_close(ag_video *v);
+AGAPI int         ag_video_get_size(const ag_video *v, int *w, int *h);
+AGAPI double      ag_video_duration(const ag_video *v);
+AGAPI double      ag_video_fps(const ag_video *v);
+AGAPI double      ag_video_time(const ag_video *v);
+AGAPI int         ag_video_frame_count(const ag_video *v);
+AGAPI int         ag_video_seek(ag_video *v, double seconds);
+AGAPI int         ag_video_next_frame(ag_video *v, ag_image **out);
+AGAPI const char *ag_video_error(const ag_video *v);
+AGAPI const char *ag_video_backend_name(const ag_video *v);
+
+AGAPI void        ag_video_set_playing(ag_video *v, int play);
+AGAPI double      ag_video_clock(ag_video *v);
+AGAPI void        ag_video_set_volume(ag_video *v, double vol);
+AGAPI int         ag_video_has_audio(const ag_video *v);
+
+AGAPI ag_widget *ag_ui_add_video(ag_ui *ui, const char *path,
+                                  int x, int y, int w, int h,
+                                  ag_widget_cb cb, void *ud);
+AGAPI ag_widget *ag_ui_add_image(ag_ui *ui, const ag_image *img,
+                                  int x, int y, int w, int h,
+                                  ag_widget_cb cb, void *ud);
+AGAPI void   ag_widget_set_blur(ag_widget *wdg, int radius, int passes);
+AGAPI void   ag_widget_set_image(ag_widget *wdg, const ag_image *img);
+AGAPI void   ag_widget_set_caption(ag_widget *wdg, const char *text);
+AGAPI void   ag_widget_prepare(ag_widget *wdg);
+AGAPI int    ag_video_widget_playing(ag_widget *wdg);
+AGAPI void   ag_video_widget_play(ag_widget *wdg, int play);
+AGAPI void   ag_video_widget_seek(ag_widget *wdg, double seconds);
+AGAPI double ag_video_widget_time(const ag_widget *wdg);
+AGAPI const char *ag_video_last_error(void);
+
+AGAPI unsigned long ag_time_ms(void);
+AGAPI const char *ag_gpu_renderer(void);
 AGAPI void ag_sleep_ms(unsigned int ms);
 
 #ifdef __cplusplus

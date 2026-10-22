@@ -2,7 +2,7 @@
 > AGLib
 
 **it's a Lightweight**
-> 3K SLOC! and just a few libs
+> 10K SLOC! + 10 MiB! and just a few libs
 
 **It's Cross-platform**
 > Can work on **UNIX And NT!**
@@ -10,17 +10,17 @@
 
 ***It's SIMPLE**
 
-> all what you need to compile is C Compiler and GNU Make!
+> all what you need to compile is a C/C++ Compiler and GNU Make!
 
 # Building
 
 ```sh
-make            # builds `app` (X11) and `app.exe` (Windows)
-make wayland    # builds `app-wayland` (Wayland)
-make app # builds `app` (X11)
-mape app.exe # builds (Windows)
+make            # builds app-wayland + app.exe (Wayland is the preferred backend)
+make app        # builds `app` (X11)
+make app.exe    # builds the Windows exe (mingw)
+make wayland    # builds `app-wayland`
+make test       # builds and runs the feature smoke test
 ```
-
 # Examples
 
 ``` c
@@ -145,6 +145,10 @@ Returns `"win32"`, `"x11"` or `"wayland"`
 
 Sleep milliseconds
 
+`unsigned long ag_time_ms(void)`
+
+Monotonic clock in milliseconds — use it for animations and playback
+
 ### Window
 
 `ag_window *ag_window_create(title, w, h)`
@@ -254,14 +258,20 @@ Draw UTF-8 text
 Draw image (with alpha, bilinear scaling)
 
 ### Fonts
-
 `ag_font *ag_font_open(name_or_path, px)`
 
 Load font (Win32: family name, X11: TTF path)
 
+`ag_font *ag_font_open_file(path, px)`
+
+Load a font **from a file** (TTF/OTF). The family name is read from the
+file itself, so it also works on Windows where fonts normally come from
+the system.
+
 `ag_font *ag_font_default(px)`
 
-Load default font
+Load default font — the copy in `assets/fonts/` first, then the usual
+system locations. The environment variable `AG_FONT` overrides the path.
 
 `void ag_font_close(f)`
 
@@ -274,6 +284,14 @@ Metrics
 `int ag_font_text_width(f, utf8)`
 
 Measure text width
+
+`const char *ag_font_family(f)`
+
+Name of the loaded family (e.g. `DejaVu Sans`)
+
+`int ag_font_set_size(f, px)`
+
+Rescale the font in place — much cheaper than reloading the file
 
 ### Images
 `ag_image *ag_image_load(path)`
@@ -288,6 +306,10 @@ Load SVG at scale
 
 Create blank image
 
+`ag_image *ag_image_clone(img)`
+
+Copy an image
+
 `void ag_image_destroy(img)`
 
 Free image
@@ -295,6 +317,27 @@ Free image
 `int ag_image_get_size(img, *w, *h)`
 
 Query size
+
+`ag_u32 ag_image_pixel(img, x, y)`
+
+Read one pixel (0xAARRGGBB)
+
+`int ag_image_save_png(img, path)`
+
+Write the image as PNG
+
+`int ag_image_blur_dual_kawase(img, radius, passes)`
+
+Dual Kawase blur in place
+
+`int ag_image_blur_box(img, radius, passes)`
+
+Separable box blur (two passes with a running sum), so the cost does
+not depend on the radius. This is the cpu fallback of the photo cards.
+
+`void ag_draw_image_blur(w, x, y, w, h, img, radius, passes)`
+
+Scale the image into a rect, blur it and draw it there (frosted card)
 
 ### UI — Creation
 `ag_ui *ag_ui_create(win)`
@@ -349,6 +392,128 @@ Single-line text input
 `ag_ui_add_textview(ui, x,y,w,h)`
 
 Scrollable log view
+
+`ag_ui_add_image(ui, img, x,y,w,h, cb, ud)`
+
+Image card. The scaled copy is cached and the blur is calculated in a
+background thread, so the card never blocks the interface — it shows
+the sharp picture until the blurred one is ready.
+
+`ag_ui_add_video(ui, path, x,y,w,h, cb, ud)`
+
+Video player widget: draws the frame, a play/pause button, a seek bar and
+the time. Click the button to play/pause, drag the bar to seek.
+
+`void ag_widget_set_blur(wdg, radius, passes)`
+
+Blur the image card with the dual Kawase filter
+
+`void ag_widget_set_caption(wdg, text)`
+
+Caption drawn over the bottom of the card
+
+`void ag_widget_set_image(wdg, img)`
+
+Replace the picture of an image card
+
+`void ag_widget_prepare(wdg)`
+
+Pre-render expensive content (blurred cards) so the first frame is fast
+
+### Animation
+`void ag_ui_set_transition(ui, type, duration_ms, ease)`
+
+Set the transition used when the page changes. Types: `AG_ANIM_FADE`,
+`AG_ANIM_SLIDE_LEFT/RIGHT/UP/DOWN`, `AG_ANIM_SCALE`, `AG_ANIM_FLIP`.
+Easings: `AG_EASE_LINEAR`, `AG_EASE_IN_QUAD`, `AG_EASE_OUT_QUAD`,
+`AG_EASE_IN_OUT_QUAD`, `AG_EASE_OUT_CUBIC`, `AG_EASE_IN_OUT_CUBIC`,
+`AG_EASE_OUT_BACK`, `AG_EASE_OUT_ELASTIC`, `AG_EASE_OUT_BOUNCE`.
+
+`void ag_ui_set_page(ui, page)`
+
+Switch to another page — starts the transition
+
+`int ag_ui_page(ui)` / `int ag_ui_animating(ui)`
+
+Current page / is a transition running
+
+`void ag_ui_update(ui)`
+
+Advance the animation and the video widgets. The event loop calls it
+automatically, so a normal application does not have to care — call it
+yourself only when you drive the loop by hand.
+
+`void ag_widget_set_page(wdg, page)`
+
+Put a widget on a page. Use `AG_PAGE_GLOBAL` (-1) for widgets that stay
+visible on every page (a sidebar, for example).
+
+`void ag_widget_set_anim_delay(wdg, ms)`
+
+Delay the widget inside the transition (staggered animations)
+
+`void ag_ui_set_page_draw_cb(ui, cb, ud)`
+
+Called while a page is rendered — the application can draw its own
+content (labels, images, ...) into the page, so that it takes part in
+the transition instead of popping up.
+
+`float ag_ease_apply(ease, t)`
+
+Apply an easing function to a value in 0..1
+
+### Video
+`ag_video *ag_video_open(path)` / `ag_video_open_ex(path, backend)`
+
+Open a video. `AG_VIDEO_BACKEND_AUTO` detects the container by its
+signature (AVI, raw MJPEG stream, MP4, MKV) and picks the built in
+decoder. Everything happens in process — no external players or tools.
+
+Containers: MP4/MOV (ISO-BMFF), MKV/WebM (EBML), AVI and a raw MJPEG
+stream. Codecs: H.264 video (any profile, B frames included), MJPEG
+video, AAC and MP3 audio. The decoders are linked into the binary, so a
+plain `movie.mp4` or `movie.mkv` (H.264 + AAC) plays without anything
+installed — the same on Linux and on Windows. A file whose video codec is
+not H.264/MJPEG (HEVC, VP9, AV1, ...) fails to open with an error naming
+the codec; an unsupported audio codec (Vorbis, Opus, ...) plays the video
+without sound.
+
+`void ag_video_close(v)`
+
+Close
+
+`int ag_video_get_size(v, *w, *h)` / `double ag_video_duration(v)` / `double ag_video_fps(v)`
+
+Properties
+
+`double ag_video_time(v)` / `int ag_video_frame_count(v)`
+
+Playback position / number of frames
+
+`int ag_video_seek(v, seconds)`
+
+Jump to a position
+
+`int ag_video_next_frame(v, &image)`
+
+Decode the next frame. The image belongs to the video and stays valid
+until the next call.
+
+`const char *ag_video_error(v)` / `ag_video_last_error()`
+
+Error messages
+
+`const char *ag_video_backend_name(v)`
+
+Which backend is in use
+
+`void ag_video_widget_play(wdg, play)` / `ag_video_widget_seek(wdg, sec)`
+
+Control the player widget
+
+`int ag_video_widget_playing(wdg)` / `double ag_video_widget_time(wdg)`
+
+Player state
 
 ### UI — Widget ops
 `ag_widget_remove(ui, wdg)`
@@ -411,3 +576,13 @@ Clear log
 `void ag_textview_set_scroll(wdg, line)`
 
 Set scroll (-1 = pin to bottom)
+
+# Licenses
+
+AGLib keeps every dependency as a git submodule (`git submodule update
+--init` fetches them) and links it statically: the built binaries need no
+system packages and load nothing at runtime. Third party notices, license
+texts and where to get the sources are collected in [NOTICE](NOTICE) —
+notably OpenH264 (BSD-2-Clause) and the Fraunhofer FDK AAC codec (whose
+license text is retained in the submodule and has to travel with binary
+redistributions).

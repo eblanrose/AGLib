@@ -1,6 +1,8 @@
 app
 app.exe
 app-wayland
+agtest
+assets/demo.mp4
 *.o
 third_party/wayland/*-client-protocol.h
 third_party/wayland/*-protocol.c
@@ -12,3 +14,4 @@ third_party/wayland/*-protocol.c
 *.svg
 !test.png
 !test.jpg
+assets/test.mp4

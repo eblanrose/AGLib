@@ -1,43 +1,59 @@
 #include "aglib.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 
-#define SIDE_X  20
-#define SIDE_W  160
-#define FIELD_X 200
-#define FIELD_M 20
+#define SIDE_X   20
+#define SIDE_W   160
+#define FIELD_X  200
+#define FIELD_M  20
 
-#define IMG_LIMIT 4
+#define PAGE_LOG    0
+#define PAGE_PHOTOS 1
+#define PAGE_VIDEO  2
+#define PAGE_SETUP  3
+
+#define PHOTO_CARDS 3
 
 static ag_window *g_win;
 static ag_ui    *g_ui;
 static ag_font  *g_font;
-static int g_win_w = 820, g_win_h = 560;
+static int g_win_w = 900, g_win_h = 600;
 static int g_font_px = 16;
 static int g_theme_green = 1;
-static int g_tab = 0;
 static int g_borders = 1;
 static int g_main_c[3] = { 22, 26, 36 };
+static int g_blur = 10;
+static int g_page = PAGE_LOG;
 
-static ag_widget *g_log, *g_info;
-static ag_widget *g_console;
+static ag_widget *g_log, *g_info, *g_console;
 static ag_widget *g_btn_tab[4];
 static ag_widget *g_btn_theme, *g_btn_clear, *g_btn_exit;
-static ag_widget *g_sl_font;
-static ag_widget *g_tgl_borders;
-static ag_widget *g_sl_c[3];
+static ag_widget *g_sl_font, *g_tgl_borders, *g_sl_c[3];
+static ag_widget *g_sl_blur, *g_btn_anim;
+static ag_widget *g_card[PHOTO_CARDS];
+static ag_widget *g_video;
+static ag_widget *g_video_mp4;
 
-static int g_main_x, g_main_y, g_main_w, g_main_h;  
-static int g_con_y;                                  
+static ag_image *g_img[PHOTO_CARDS];
+static const char *g_img_name[PHOTO_CARDS] = { "assets/test.jpg", "assets/test.png", "assets/test.bmp" };
+static int g_card_sharp[PHOTO_CARDS];
 
-static ag_image *g_img[IMG_LIMIT];
-static const char *g_img_name[IMG_LIMIT];
-static int g_img_n = 0;
-static int g_img_cur = 0;
+static int    g_main_x, g_main_y, g_main_w, g_main_h;
+static int    g_con_y;
+
+static const ag_anim_type g_anim_types[] = {
+    AG_ANIM_FADE, AG_ANIM_SLIDE_LEFT, AG_ANIM_SLIDE_RIGHT,
+    AG_ANIM_SLIDE_UP, AG_ANIM_SLIDE_DOWN, AG_ANIM_SCALE, AG_ANIM_FLIP
+};
+static const char *g_anim_names[] = {
+    "затухание", "сдвиг влево", "сдвиг вправо",
+    "сдвиг снизу", "сдвиг сверху", "масштаб", "флип"
+};
+static int g_anim_idx = 1;
 
 static void log_line(const char *tag, const char *msg);
-static void show_tab(void);
 
 static void apply_theme(void)
 {
@@ -77,17 +93,29 @@ static void apply_theme(void)
     ag_ui_set_theme(g_ui, &th);
 }
 
-static void apply_font_px(int px)
+static int apply_font_px(int px)
 {
     if (px < 8)  px = 8;
     if (px > 48) px = 48;
-    ag_font *nf = ag_font_default((unsigned)px);
-    if (!nf) return;
-    ag_font_close(g_font);                  
-    g_font = nf;
+    if (!g_font) {
+        g_font = ag_font_open_file("assets/fonts/DejaVuSans.ttf", (unsigned)px);
+        if (!g_font) g_font = ag_font_default((unsigned)px);
+        if (!g_font) return 0;
+        ag_window_set_font(g_win, g_font);
+        ag_ui_set_font(g_ui, g_font);
+    } else if (!ag_font_set_size(g_font, (unsigned)px)) {
+        return 0;
+    }
     g_font_px = px;
-    ag_window_set_font(g_win, g_font);
-    ag_ui_set_font(g_ui, g_font);
+    return 1;
+}
+
+static void apply_blur(void)
+{
+    for (int i = 0; i < PHOTO_CARDS; ++i) {
+        if (!g_card[i]) continue;
+        ag_widget_set_blur(g_card[i], g_card_sharp[i] ? 0 : g_blur, 1);
+    }
 }
 
 static void on_layout(ag_ui *ui, int w, int h, void *ud)
@@ -114,77 +142,31 @@ static void on_layout(ag_ui *ui, int w, int h, void *ud)
     if (g_main_h < 30) g_main_h = 30;
     g_main_w = mw;
 
-    show_tab();
-}
+    ag_widget_set_rect(g_log,     g_main_x, g_main_y, g_main_w, g_main_h);
+    ag_widget_set_rect(g_console, g_main_x, g_con_y, g_main_w, 26);
 
-static void show_tab(void)
-{
-    const int off = -8000;
-    if (g_tab == 0) {
-        ag_widget_set_rect(g_log,     g_main_x, g_main_y, g_main_w, g_main_h);
-        ag_widget_set_rect(g_info,    off, 0, 1, 1);
-        ag_widget_set_rect(g_console, g_main_x, g_con_y, g_main_w, 26);
-        ag_widget_set_rect(g_tgl_borders, off, 0, 1, 1);
-        ag_widget_set_rect(g_sl_font, off, 0, 1, 1);
-        ag_widget_set_rect(g_sl_c[0], off, 0, 1, 1);
-        ag_widget_set_rect(g_sl_c[1], off, 0, 1, 1);
-        ag_widget_set_rect(g_sl_c[2], off, 0, 1, 1);
-    } else if (g_tab == 1) {
-        ag_widget_set_rect(g_log,     off, 0, 1, 1);
-        ag_widget_set_rect(g_info,    off, 0, 1, 1);
-        ag_widget_set_rect(g_console, off, 0, 1, 1);
-        ag_widget_set_rect(g_tgl_borders, off, 0, 1, 1);
-        ag_widget_set_rect(g_sl_font, off, 0, 1, 1);
-        ag_widget_set_rect(g_sl_c[0], off, 0, 1, 1);
-        ag_widget_set_rect(g_sl_c[1], off, 0, 1, 1);
-        ag_widget_set_rect(g_sl_c[2], off, 0, 1, 1);
-    } else if (g_tab == 2) {
-        ag_widget_set_rect(g_log,     off, 0, 1, 1);
-        ag_widget_set_rect(g_info,    g_main_x, g_main_y, g_main_w, g_main_h);
-        ag_widget_set_rect(g_console, off, 0, 1, 1);
-        ag_widget_set_rect(g_tgl_borders, off, 0, 1, 1);
-        ag_widget_set_rect(g_sl_font, off, 0, 1, 1);
-        ag_widget_set_rect(g_sl_c[0], off, 0, 1, 1);
-        ag_widget_set_rect(g_sl_c[1], off, 0, 1, 1);
-        ag_widget_set_rect(g_sl_c[2], off, 0, 1, 1);
-    } else {
-        ag_widget_set_rect(g_log,     off, 0, 1, 1);
-        ag_widget_set_rect(g_info,    off, 0, 1, 1);
-        ag_widget_set_rect(g_console, off, 0, 1, 1);
-        ag_widget_set_rect(g_tgl_borders, g_main_x, g_main_y,      g_main_w, 24);
-        ag_widget_set_rect(g_sl_font,     g_main_x, g_main_y + 64, g_main_w, 24);
-        ag_widget_set_rect(g_sl_c[0],     g_main_x, g_main_y + 108, g_main_w, 24);
-        ag_widget_set_rect(g_sl_c[1],     g_main_x, g_main_y + 152, g_main_w, 24);
-        ag_widget_set_rect(g_sl_c[2],     g_main_x, g_main_y + 196, g_main_w, 24);
+    int gap = 12;
+    int cw = (g_main_w - gap * (PHOTO_CARDS - 1)) / PHOTO_CARDS;
+    if (cw < 40) cw = 40;
+    for (int i = 0; i < PHOTO_CARDS; ++i) {
+        ag_widget_set_rect(g_card[i], g_main_x + i * (cw + gap), g_main_y, cw, g_main_h);
     }
-}
 
-static void draw_photo(ag_window *w)
-{
-    if (g_img_cur >= g_img_n) return;
-    ag_image *im = g_img[g_img_cur];
-    int iw = 0, ih = 0;
-    if (ag_image_get_size(im, &iw, &ih) || iw <= 0 || ih <= 0) return;
+    int vh = (g_main_h - 12) / 2;
+    if (vh < 60) vh = 60;
+    ag_widget_set_rect(g_video, g_main_x, g_main_y, g_main_w, vh);
+    if (g_video_mp4)
+        ag_widget_set_rect(g_video_mp4, g_main_x, g_main_y + vh + 12, g_main_w, vh);
 
-    int mw = g_main_w, mh = g_main_h;
-    if (mw <= 0 || mh <= 0) return;
-
-    float k = (float)mw / iw;
-    float kh = (float)mh / ih;
-    if (kh < k) k = kh;
-    if (k > 1.0f) k = 1.0f;                 
-    int dw = (int)(iw * k);
-    int dh = (int)(ih * k);
-    int dx = g_main_x + (mw - dw) / 2;
-    int dy = g_main_y + (mh - dh) / 2;
-    ag_draw_image(w, dx, dy, dw, dh, im);
-
-    char cap[96];
-    snprintf(cap, sizeof(cap), "%s  %dx%d  — клик по области — следующий",
-             g_img_name[g_img_cur], iw, ih);
-    int luma = (g_main_c[0] * 299 + g_main_c[1] * 587 + g_main_c[2] * 114) / 1000;
-    ag_set_color(w, luma > 140 ? AG_RGB(20, 24, 32) : AG_RGB(222, 222, 222));
-    ag_draw_text(w, g_main_x + 4, g_main_y + 4, cap);
+    int sw = g_main_w - 170;
+    if (sw < 80) sw = 80;
+    ag_widget_set_rect(g_tgl_borders, g_main_x, g_main_y,      g_main_w, 24);
+    ag_widget_set_rect(g_sl_font,     g_main_x, g_main_y + 40, sw, 24);
+    ag_widget_set_rect(g_sl_blur,     g_main_x, g_main_y + 80, sw, 24);
+    ag_widget_set_rect(g_btn_anim,    g_main_x, g_main_y + 120, g_main_w, 30);
+    ag_widget_set_rect(g_sl_c[0],     g_main_x, g_main_y + 170, sw, 24);
+    ag_widget_set_rect(g_sl_c[1],     g_main_x, g_main_y + 210, sw, 24);
+    ag_widget_set_rect(g_sl_c[2],     g_main_x, g_main_y + 250, sw, 24);
 }
 
 static void log_line(const char *tag, const char *msg)
@@ -196,11 +178,22 @@ static void log_line(const char *tag, const char *msg)
     fflush(stdout);
 }
 
+static void switch_page(int page)
+{
+    if (page == g_page) return;
+    g_page = page;
+    ag_ui_set_page(g_ui, page);
+    const char *names[] = { "лог", "фото", "видео", "настройки" };
+    char m[128];
+    snprintf(m, sizeof(m), "страница: %s (анимация: %s)",
+             names[page], g_anim_names[g_anim_idx]);
+    log_line("ui", m);
+}
+
 static void on_tab(ag_widget *wdg, void *ud)
 {
     (void)wdg;
-    g_tab = (int)(intptr_t)ud;
-    show_tab();
+    switch_page((int)(intptr_t)ud);
 }
 
 static void on_theme(ag_widget *wdg, void *ud)
@@ -242,7 +235,40 @@ static void on_font(ag_widget *wdg, void *ud)
 {
     (void)ud;
     int px = (int)ag_slider_value(wdg);
-    if (px != g_font_px) apply_font_px(px);
+    if (px != g_font_px && apply_font_px(px))
+        log_line("font", ag_font_family(g_font));
+}
+
+static void on_blur(ag_widget *wdg, void *ud)
+{
+    (void)ud;
+    g_blur = (int)ag_slider_value(wdg);
+    apply_blur();
+    char m[64];
+    snprintf(m, sizeof(m), "радиус блюра карточек: %d px", g_blur);
+    log_line("blur", m);
+}
+
+static void on_anim(ag_widget *wdg, void *ud)
+{
+    (void)wdg; (void)ud;
+    g_anim_idx = (g_anim_idx + 1) % (int)(sizeof(g_anim_types) / sizeof(g_anim_types[0]));
+    ag_ui_set_transition(g_ui, g_anim_types[g_anim_idx], 320, AG_EASE_IN_OUT_CUBIC);
+    char m[96];
+    snprintf(m, sizeof(m), "анимация: %s", g_anim_names[g_anim_idx]);
+    log_line("ui", m);
+}
+
+static void on_card(ag_widget *wdg, void *ud)
+{
+    (void)wdg;
+    int idx = (int)(intptr_t)ud;
+    g_card_sharp[idx] = !g_card_sharp[idx];
+    apply_blur();
+    char m[96];
+    snprintf(m, sizeof(m), "карточка %s: %s", g_img_name[idx],
+             g_card_sharp[idx] ? "резкая" : "размытая (dual kawase)");
+    log_line("blur", m);
 }
 
 static void on_console(ag_widget *wdg, void *ud)
@@ -255,25 +281,47 @@ static void on_console(ag_widget *wdg, void *ud)
     if (strcmp(cmd, "clear") == 0) { ag_textview_clear(g_log); return; }
     if (strcmp(cmd, "about") == 0) {
         ag_textview_append(g_log,
-            "AGLib — кроссплатформенная GUI-библиотека на чистом C: "
-            "виджеты, TrueType, PNG/JPEG/SVG, темы. Ввод UTF-8.\n");
+            "AGLib — кроссплатформенная GUI-библиотека на чистом C.\n"
+            "Шрифт грузится из файла, фото-карточки размываются dual kawase,\n"
+            "переключение страниц анимируется, видео (mp4/mkv, AVI) играется\n"
+            "со звуком — всё встроено, ничего устанавливать не нужно.\n");
         return;
     }
     log_line("cmd", cmd);
     ag_textbox_set_text(wdg, "");
 }
 
+static void draw_page(ag_ui *ui, int page, void *ud)
+{
+    (void)ui; (void)ud;
+    ag_window *w = g_win;
+
+    int luma = (g_main_c[0] * 299 + g_main_c[1] * 587 + g_main_c[2] * 114) / 1000;
+    ag_color hc = luma > 140 ? AG_RGB(20, 24, 32) : AG_RGB(222, 222, 222);
+    ag_set_color(w, hc);
+    ag_draw_text(w, 20, 14, "AGLib");
+    char st[160];
+    snprintf(st, sizeof(st), "%dx%d  %s  %s %dpx",
+             g_win_w, g_win_h, ag_get_platform(),
+             g_font ? ag_font_family(g_font) : "bitmap", g_font_px);
+    ag_draw_text(w, g_win_w - 20 - ag_font_text_width(g_font, st), 14, st);
+
+    if (page == PAGE_SETUP) {
+        char lbl[64];
+        int lx = g_main_x + g_main_w - 150;
+        snprintf(lbl, sizeof(lbl), "Шрифт %dpx", g_font_px);
+        ag_draw_text(w, lx, g_main_y + 44, lbl);
+        snprintf(lbl, sizeof(lbl), "Блюр %dpx", g_blur);
+        ag_draw_text(w, lx, g_main_y + 84, lbl);
+        ag_draw_text(w, lx, g_main_y + 174, "цвет R");
+        ag_draw_text(w, lx, g_main_y + 214, "G");
+        ag_draw_text(w, lx, g_main_y + 254, "B");
+    }
+}
+
 static int on_event(ag_window *w, const ag_event *e, void *ud)
 {
     (void)ud;
-
-    if (g_tab == 1 && e->type == AG_EVENT_MOUSE_DOWN &&
-        e->x >= g_main_x && e->x < g_main_x + g_main_w &&
-        e->y >= g_main_y && e->y < g_main_y + g_main_h) {
-        if (g_img_n > 1) g_img_cur = (g_img_cur + 1) % g_img_n;
-        ag_window_redraw(w);
-        return 1;
-    }
 
     if (g_ui && ag_ui_handle(g_ui, e)) {
         ag_window_redraw(w);
@@ -283,38 +331,19 @@ static int on_event(ag_window *w, const ag_event *e, void *ud)
     if (e->type == AG_EVENT_EXPOSE) {
         ag_begin_frame(w);
         ag_clear(w, AG_RGB(g_main_c[0], g_main_c[1], g_main_c[2]));
-
-        int luma = (g_main_c[0] * 299 + g_main_c[1] * 587 + g_main_c[2] * 114) / 1000;
-        ag_color hc = luma > 140 ? AG_RGB(20, 24, 32) : AG_RGB(222, 222, 222);
-        ag_set_color(w, hc);
-        ag_draw_text(w, 20, 14, "AGLib");
-        char st[96];
-        snprintf(st, sizeof(st), "%dx%d  %s  %dpx",
-                 g_win_w, g_win_h, ag_get_platform(), g_font_px);
-        ag_draw_text(w, g_win_w - 20 - ag_font_text_width(g_font, st), 14, st);
-
-        if (g_tab == 3) {
-            ag_set_color(w, hc);
-            char lbl[64];
-            snprintf(lbl, sizeof(lbl), "Шрифт %dpx", g_font_px);
-            ag_draw_text(w, g_main_x, g_main_y + 44, lbl);
-            ag_draw_text(w, g_main_x, g_main_y + 88, "Главный цвет — R");
-            ag_draw_text(w, g_main_x, g_main_y + 132, "G");
-            ag_draw_text(w, g_main_x, g_main_y + 176, "B");
-        }
-
         ag_ui_draw(g_ui);
-
-        if (g_tab == 1) draw_photo(w);
-
         ag_end_frame(w);
         return 1;
     }
 
     if (e->type == AG_EVENT_KEY_DOWN) {
-        if (e->key == 27 || e->key == 0xFF1B) {
-            printf("esc\n");
-            ag_quit();
+        if (e->key == 27 || e->key == 0xFF1B) { ag_quit(); return 1; }
+        if (e->key == '1' || e->key == 0xFF1B) { switch_page(PAGE_LOG); return 1; }
+        if (e->key == '2') { switch_page(PAGE_PHOTOS); return 1; }
+        if (e->key == '3') { switch_page(PAGE_VIDEO); return 1; }
+        if (e->key == '4') { switch_page(PAGE_SETUP); return 1; }
+        if (e->key == ' ') {
+            if (g_video) ag_video_widget_play(g_video, !ag_video_widget_playing(g_video));
             return 1;
         }
         return 1;
@@ -326,19 +355,21 @@ int main(void)
 {
     if (ag_init() != 0) { fprintf(stderr, "init failed\n"); return 1; }
 
-    g_win = ag_window_create("AGLib App", 820, 560);
+    g_win = ag_window_create("AGLib App", g_win_w, g_win_h);
     ag_window_set_callback(g_win, on_event, NULL);
     ag_window_show(g_win);
 
-    apply_font_px(16);                      
+    apply_font_px(16);
 
     g_ui = ag_ui_create(g_win);
     apply_theme();
+    ag_ui_set_transition(g_ui, AG_ANIM_SLIDE_LEFT, 320, AG_EASE_IN_OUT_CUBIC);
+    ag_ui_set_page_draw_cb(g_ui, draw_page, NULL);
 
-    g_btn_tab[0] = ag_ui_add_button(g_ui, "Лог", 0, 0, 0, 0, on_tab, (void *)(intptr_t)0);
-    g_btn_tab[1] = ag_ui_add_button(g_ui, "Фото", 0, 0, 0, 0, on_tab, (void *)(intptr_t)1);
-    g_btn_tab[2] = ag_ui_add_button(g_ui, "Инфо", 0, 0, 0, 0, on_tab, (void *)(intptr_t)2);
-    g_btn_tab[3] = ag_ui_add_button(g_ui, "Настройки", 0, 0, 0, 0, on_tab, (void *)(intptr_t)3);
+    g_btn_tab[0] = ag_ui_add_button(g_ui, "Лог", 0, 0, 0, 0, on_tab, (void *)(intptr_t)PAGE_LOG);
+    g_btn_tab[1] = ag_ui_add_button(g_ui, "Фото", 0, 0, 0, 0, on_tab, (void *)(intptr_t)PAGE_PHOTOS);
+    g_btn_tab[2] = ag_ui_add_button(g_ui, "Видео", 0, 0, 0, 0, on_tab, (void *)(intptr_t)PAGE_VIDEO);
+    g_btn_tab[3] = ag_ui_add_button(g_ui, "Настройки", 0, 0, 0, 0, on_tab, (void *)(intptr_t)PAGE_SETUP);
     g_btn_theme  = ag_ui_add_button(g_ui, "Тема", 0, 0, 0, 0, on_theme, NULL);
     g_btn_clear  = ag_ui_add_button(g_ui, "Очистить лог", 0, 0, 0, 0, on_clear, NULL);
     g_btn_exit   = ag_ui_add_button(g_ui, "Exit", 0, 0, 0, 0, on_exit, NULL);
@@ -350,18 +381,40 @@ int main(void)
     ag_textview_append(g_info,
         "AGLib: каркас приложения.\n"
         "\n"
-        "Вкладки слева переключают основной регион.\n"
+        "Вкладки слева переключают страницы с анимацией.\n"
         "«Лог» — лента событий; длинные строки переносятся по ширине окна.\n"
         "Строка под логом — команды: ввод + Enter (clear, about, exit).\n"
-        "«Фото» — картинки JPEG/PNG, вписываются в область; клик — смена кадра.\n"
-        "«Настройки» — тумблер рамок, слайдер шрифта и главный цвет R/G/B.\n"
-        "Ввод — UTF-8, русская раскладка работает (X11 и Windows).\n"
-        "Esc — выход, если фокус не в поле ввода.\n");
+        "«Фото» — карточки JPEG/PNG/BMP с размытием dual kawase;\n"
+        "клик по карточке делает её резкой.\n"
+        "«Видео» — mp4/mkv со звуком (H.264 + AAC/MP3), AVI/MJPEG.\n"
+        "«Настройки» — анимация, шрифт из файла, радиус блюра, тема.\n"
+        "Клавиши 1..4 — страницы, пробел — пауза видео, Esc — выход.\n");
+
+    for (int i = 0; i < PHOTO_CARDS; ++i) {
+        g_img[i] = ag_image_load(g_img_name[i]);
+        if (!g_img[i]) {
+            char m[128];
+            snprintf(m, sizeof(m), "не загрузилась: %s", g_img_name[i]);
+            log_line("img", m);
+        }
+        g_card[i] = ag_ui_add_image(g_ui, g_img[i], 0, 0, 0, 0, on_card,
+                                    (void *)(intptr_t)i);
+        char cap[64];
+        snprintf(cap, sizeof(cap), "%s", g_img_name[i]);
+        ag_widget_set_caption(g_card[i], cap);
+        ag_widget_set_blur(g_card[i], g_blur, 1);
+        ag_widget_prepare(g_card[i]);
+    }
+
+    g_video = ag_ui_add_video(g_ui, "assets/test.mp4", 0, 0, 0, 0, NULL, NULL);
 
     g_sl_font = ag_ui_add_slider(g_ui, 10.0f, 26.0f, 16.0f,
                                  0, 0, 0, 0, on_font, NULL);
     g_tgl_borders = ag_ui_add_toggle(g_ui, "Рамки",
                                      g_borders, 0, 0, on_borders, NULL);
+    g_sl_blur = ag_ui_add_slider(g_ui, 0.0f, 24.0f, (float)g_blur,
+                                 0, 0, 0, 0, on_blur, NULL);
+    g_btn_anim = ag_ui_add_button(g_ui, "Анимация", 0, 0, 0, 0, on_anim, NULL);
     g_sl_c[0] = ag_ui_add_slider(g_ui, 0.0f, 255.0f, (float)g_main_c[0],
                                  0, 0, 0, 0, on_col, (void *)(intptr_t)0);
     g_sl_c[1] = ag_ui_add_slider(g_ui, 0.0f, 255.0f, (float)g_main_c[1],
@@ -369,36 +422,53 @@ int main(void)
     g_sl_c[2] = ag_ui_add_slider(g_ui, 0.0f, 255.0f, (float)g_main_c[2],
                                  0, 0, 0, 0, on_col, (void *)(intptr_t)2);
 
-    ag_ui_set_layout_cb(g_ui, on_layout, NULL);
-    on_layout(g_ui, 820, 560, NULL);        
+    ag_widget_set_page(g_btn_tab[0], -1);
+    ag_widget_set_page(g_btn_tab[1], -1);
+    ag_widget_set_page(g_btn_tab[2], -1);
+    ag_widget_set_page(g_btn_tab[3], -1);
+    ag_widget_set_page(g_btn_theme, -1);
+    ag_widget_set_page(g_btn_clear, -1);
+    ag_widget_set_page(g_btn_exit, -1);
 
-    const char *photos[] = { "test.jpg", "test.png", "test.bmp", NULL };
-    for (int i = 0; photos[i]; ++i) {
-        if (g_img_n >= IMG_LIMIT) break;
-        ag_image *im = ag_image_load(photos[i]);
-        if (im) {
-            g_img[g_img_n] = im;
-            g_img_name[g_img_n] = photos[i];
-            ++g_img_n;
-        } else {
-            char m[128];
-            snprintf(m, sizeof(m), "не загрузилась: %s", photos[i]);
-            log_line("img", m);
-        }
-    }
-    if (g_img_n > 0) {
-        printf("loaded %d photo(s)\n", g_img_n);
-        log_line("img", "кадр 1 готов, клик по вкладке «Фото»");
-    } else {
-        log_line("img", "нет картинок (test.jpg / test.png)");
-    }
+    ag_widget_set_page(g_log, PAGE_LOG);
+    ag_widget_set_page(g_console, PAGE_LOG);
+    ag_widget_set_page(g_info, PAGE_LOG);
+
+    for (int i = 0; i < PHOTO_CARDS; ++i)
+        ag_widget_set_page(g_card[i], PAGE_PHOTOS);
+    ag_widget_set_page(g_video, PAGE_VIDEO);
+
+    ag_widget_set_page(g_tgl_borders, PAGE_SETUP);
+    ag_widget_set_page(g_sl_font, PAGE_SETUP);
+    ag_widget_set_page(g_sl_blur, PAGE_SETUP);
+    ag_widget_set_page(g_btn_anim, PAGE_SETUP);
+    ag_widget_set_page(g_sl_c[0], PAGE_SETUP);
+    ag_widget_set_page(g_sl_c[1], PAGE_SETUP);
+    ag_widget_set_page(g_sl_c[2], PAGE_SETUP);
+
+    ag_ui_set_layout_cb(g_ui, on_layout, NULL);
+    on_layout(g_ui, g_win_w, g_win_h, NULL);
 
     log_line("app", "запуск");
-    log_line("app", "перенос по ширине окна: растяните окно — длинные строки лягут заново.");
+    {
+        const char *gpu = ag_gpu_renderer();
+        char m[128];
+        if (gpu && *gpu)
+            snprintf(m, sizeof(m), "gpu: %s", gpu);
+        else
+            snprintf(m, sizeof(m), "gpu: нет (только cpu)");
+        log_line("app", m);
+    }
+    log_line("font", g_font ? ag_font_family(g_font) : "встроенный 8x8");
+    log_line("app", "переключение страниц анимировано (см. «Настройки»)");
 
-    ag_main_loop();
+    for (;;) {
+        ag_ui_update(g_ui);
+        if (!ag_poll_events()) break;
+        ag_sleep_ms(8);
+    }
 
-    for (int i = 0; i < g_img_n; ++i) ag_image_destroy(g_img[i]);
+    for (int i = 0; i < PHOTO_CARDS; ++i) ag_image_destroy(g_img[i]);
     ag_ui_destroy(g_ui);
     ag_window_destroy(g_win);
     ag_font_close(g_font);

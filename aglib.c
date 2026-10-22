@@ -1,4 +1,7 @@
 #include "aglib.h"
+#include "aglib_int.h"
+#include "agthread.h"
+#include "aggl.h"
 
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
@@ -57,6 +60,15 @@ struct ag_window {
 
     int      clip_on, clip_x, clip_y, clip_w, clip_h;
 
+    int      alpha;
+    int      ox, oy;
+
+    ag_u32  *rt;
+    int      rt_w, rt_h;
+
+    ag_gl_layer layers[2];
+    int         nlayers;
+
     ag_u32 *backbuf;
 
     ag_event_cb cb;
@@ -65,7 +77,8 @@ struct ag_window {
     int  should_close;
     int  redraw_pending;           
 
-    ag_font *font;               
+    ag_font *font;
+    struct ag_ui *ui;
 
 #ifdef _WIN32
     HWND      hwnd;
@@ -93,66 +106,29 @@ struct ag_window {
     Atom      wm_delete;
     int       screen;
     XIM       xim;                
-    XIC       xic;                
+    XIC       xic;
+    void     *gl_visual;
+    Colormap  gl_cmap;
+    ag_gl_present *present;
 #endif
 
     struct ag_window *next;
 };
 
-#define AG_GLYPH_CACHE 128
+#define AG_GLYPH_CACHE 512
 
-struct ag_glyph {                 
+struct ag_glyph {
     ag_u32 cp;
-    int xoff, yoff;               
+    int xoff, yoff;
     int w, h;
-    int adv;                      
+    int adv;
     ag_u8 *bits;
 };
 
-struct ag_font {
-    unsigned int px;
-    int ascent, descent;
-    struct ag_glyph cache[AG_GLYPH_CACHE];
-    int cache_next;
-#ifdef _WIN32
-    HFONT hfont;
-    HDC   dc;
-#else
-    FT_Face face;
-#endif
-};
-
-struct ag_image {
-    int w, h;
-    ag_u32 *pixels;               
-};
-
-static inline int font_height(const ag_font *f)
+static inline int ag_glyph_slot(ag_u32 cp)
 {
-#ifdef _WIN32
-    return f->ascent + f->descent;
-#else
-    return f->ascent - f->descent;
-#endif
+    return (int)((cp * 2654435761u) >> 22) & (AG_GLYPH_CACHE - 1);
 }
-
-static ag_window *g_windows = NULL;
-static int        g_running = 0;
-
-void ag_sleep_ms(unsigned int ms)
-{
-#ifdef _WIN32
-    Sleep(ms);
-#else
-    struct timespec ts;
-    ts.tv_sec  = ms / 1000;
-    ts.tv_nsec = (ms % 1000) * 1000000L;
-    nanosleep(&ts, NULL);
-#endif
-}
-
-static void *ag_mem_alloc(size_t sz) { return calloc(1, sz); }
-static void  ag_mem_free(void *p)    { free(p); }
 
 static ag_u32 utf8_decode(const char **s)
 {
@@ -184,6 +160,188 @@ static int utf8_encode(char out[4], ag_u32 cp)
     return 4;
 }
 
+struct ag_font {
+    unsigned int px;
+    int ascent, descent;
+    struct ag_glyph cache[AG_GLYPH_CACHE];
+    char family[64];
+#ifdef _WIN32
+    HFONT hfont;
+    HDC   dc;
+#else
+    FT_Face face;
+#endif
+};
+
+static const char *ag_font_paths[] = {
+    "assets/fonts/DejaVuSans.ttf",
+    "assets/fonts/DejaVuSans-Bold.ttf",
+    "DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    NULL
+};
+
+static void ag_font_clear_cache(ag_font *f)
+{
+    if (!f) return;
+    for (int i = 0; i < AG_GLYPH_CACHE; ++i) {
+        free(f->cache[i].bits);
+        memset(&f->cache[i], 0, sizeof(f->cache[i]));
+    }
+}
+
+static int ag_ttf_family(const char *path, char *out, int cap)
+{
+    if (!path || !out || cap < 2) return 0;
+    out[0] = 0;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+
+    unsigned char hdr[12];
+    if (fread(hdr, 1, 12, f) != 12) { fclose(f); return 0; }
+
+    if (memcmp(hdr, "ttcf", 4) == 0) {
+        unsigned char b4[4];
+        if (fseek(f, 12, SEEK_SET) != 0) { fclose(f); return 0; }
+        if (fread(b4, 1, 4, f) != 4) { fclose(f); return 0; }
+        long base = (long)(((unsigned)b4[0] << 24) | ((unsigned)b4[1] << 16) |
+                           ((unsigned)b4[2] << 8) | b4[3]);
+        if (fseek(f, base, SEEK_SET) != 0) { fclose(f); return 0; }
+        if (fread(hdr, 1, 12, f) != 12) { fclose(f); return 0; }
+    }
+
+    int num = (hdr[4] << 8) | hdr[5];
+    unsigned int name_off = 0, name_len = 0;
+    for (int i = 0; i < num; ++i) {
+        unsigned char rec[16];
+        if (fread(rec, 1, 16, f) != 16) break;
+        if (memcmp(rec, "name", 4) == 0) {
+            name_off = ((unsigned)rec[8] << 24) | ((unsigned)rec[9] << 16) |
+                        ((unsigned)rec[10] << 8) | rec[11];
+            name_len = ((unsigned)rec[12] << 24) | ((unsigned)rec[13] << 16) |
+                       ((unsigned)rec[14] << 8) | rec[15];
+            break;
+        }
+    }
+    if (!name_off || !name_len) { fclose(f); return 0; }
+
+    if (fseek(f, (long)name_off, SEEK_SET) != 0) { fclose(f); return 0; }
+    unsigned char nh[6];
+    if (fread(nh, 1, 6, f) != 6) { fclose(f); return 0; }
+    int count = (nh[2] << 8) | nh[3];
+    int str_off = (nh[4] << 8) | nh[5];
+
+    for (int i = 0; i < count; ++i) {
+        unsigned char rec[12];
+        if (fread(rec, 1, 12, f) != 12) break;
+        int platform = (rec[0] << 8) | rec[1];
+        int nameid   = (rec[6] << 8) | rec[7];
+        int len      = (rec[8] << 8) | rec[9];
+        int off      = (rec[10] << 8) | rec[11];
+        if (nameid != 1) continue;
+        if (len <= 0 || len > 1024) continue;
+        if (fseek(f, (long)name_off + str_off + off, SEEK_SET) != 0) continue;
+        char raw[1024];
+        if (fread(raw, 1, (size_t)len, f) != (size_t)len) continue;
+
+        int o = 0;
+        if (platform == 0 || platform == 3) {
+            for (int k = 0; k + 1 < len && o < cap - 4; k += 2) {
+                unsigned cp = ((unsigned)(unsigned char)raw[k] << 8) |
+                              (unsigned char)raw[k + 1];
+                if (!cp) break;
+                o += utf8_encode(out + o, cp);
+            }
+        } else {
+            for (int k = 0; k < len && o < cap - 1; ++k) {
+                if (!raw[k]) break;
+                out[o++] = raw[k];
+            }
+        }
+        out[o] = 0;
+        if (o > 0) { fclose(f); return 1; }
+    }
+    fclose(f);
+    return 0;
+}
+
+#ifdef _WIN32
+static int ag_is_font_file(const char *name)
+{
+    if (!name) return 0;
+    const char *dot = strrchr(name, '.');
+    if (!dot) return 0;
+    if (strcmp(dot, ".ttf") && strcmp(dot, ".TTF") &&
+        strcmp(dot, ".otf") && strcmp(dot, ".OTF") &&
+        strcmp(dot, ".ttc") && strcmp(dot, ".TTC")) return 0;
+    return 1;
+}
+#endif
+
+static ag_font *ag_font_default_common(unsigned int px)
+{
+    const char *env = getenv("AG_FONT");
+    if (env && *env) {
+        ag_font *f = ag_font_open_file(env, px);
+        if (f) return f;
+    }
+    for (int i = 0; ag_font_paths[i]; ++i) {
+        ag_font *f = ag_font_open_file(ag_font_paths[i], px);
+        if (f) return f;
+    }
+    return NULL;
+}
+
+static inline int font_height(const ag_font *f)
+{
+#ifdef _WIN32
+    return f->ascent + f->descent;
+#else
+    return f->ascent - f->descent;
+#endif
+}
+
+static ag_window *g_windows = NULL;
+static int        g_running = 0;
+
+unsigned long ag_time_ms(void)
+{
+#ifdef _WIN32
+    return (unsigned long)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long)(ts.tv_sec * 1000UL + ts.tv_nsec / 1000000UL);
+#endif
+}
+
+static void ag_quit_windows(void)
+{
+    for (ag_window *w = g_windows; w; w = w->next)
+        w->should_close = 1;
+}
+
+void ag_sleep_ms(unsigned int ms)
+{
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    struct timespec ts;
+    ts.tv_sec  = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+#endif
+}
+
+static void *ag_mem_alloc(size_t sz) { return calloc(1, sz); }
+static void  ag_mem_free(void *p)    { free(p); }
+
 static void backbuf_resize(ag_window *w, int new_w, int new_h)
 {
     if (new_w <= 0) new_w = 1;
@@ -199,13 +357,49 @@ static void backbuf_resize(ag_window *w, int new_w, int new_h)
         w->backbuf[i] = 0xFF000000u;
 }
 
+static inline void blend_px(ag_window *w, int x, int y, ag_u32 rgb, int alpha);
+
+static inline void rt_blend(ag_window *w, int x, int y, ag_u32 rgb, int alpha)
+{
+    int sa = alpha * w->alpha / 255;
+    if (sa <= 0) return;
+    if (sa > 255) sa = 255;
+    if (w->clip_on &&
+        (x < w->clip_x || y < w->clip_y ||
+         x >= w->clip_x + w->clip_w || y >= w->clip_y + w->clip_h))
+        return;
+    if (x < 0 || y < 0 || x >= w->rt_w || y >= w->rt_h) return;
+
+    ag_u32 *d = &w->rt[y * w->rt_w + x];
+    unsigned da = (*d >> 24) & 0xFF;
+    unsigned dr = (*d >> 16) & 0xFF;
+    unsigned dg = (*d >> 8) & 0xFF;
+    unsigned db = (*d) & 0xFF;
+    unsigned sr = (rgb >> 16) & 0xFF;
+    unsigned sg = (rgb >> 8) & 0xFF;
+    unsigned sb = (rgb) & 0xFF;
+    unsigned inv = 255u - (unsigned)sa;
+    unsigned na = (unsigned)sa + da * inv / 255u;
+    unsigned nr = (sr * (unsigned)sa + dr * inv) / 255u;
+    unsigned ng = (sg * (unsigned)sa + dg * inv) / 255u;
+    unsigned nb = (sb * (unsigned)sa + db * inv) / 255u;
+    *d = (na << 24) | (nr << 16) | (ng << 8) | nb;
+}
+
 static inline void put_pixel(ag_window *w, int x, int y, ag_u32 argb)
 {
+    x += w->ox;
+    y += w->oy;
+    if (w->rt) { rt_blend(w, x, y, argb & 0x00FFFFFFu, 255); return; }
     if (w->clip_on &&
         (x < w->clip_x || y < w->clip_y ||
          x >= w->clip_x + w->clip_w || y >= w->clip_y + w->clip_h))
         return;
     if (x < 0 || y < 0 || x >= w->width || y >= w->height) return;
+    if (w->alpha < 255) {
+        blend_px(w, x, y, argb & 0x00FFFFFFu, 255);
+        return;
+    }
     w->backbuf[y * w->width + x] = argb;
 }
 
@@ -214,13 +408,16 @@ static inline ag_u32 color_to_argb(ag_color c)
     return 0xFF000000u | (c & 0x00FFFFFFu);
 }
 
-static inline void blend_argb(ag_window *w, int x, int y, ag_u32 rgb, int alpha)
+static inline void blend_px(ag_window *w, int x, int y, ag_u32 rgb, int alpha)
 {
+    if (w->rt) { rt_blend(w, x, y, rgb, alpha); return; }
     if (w->clip_on &&
         (x < w->clip_x || y < w->clip_y ||
          x >= w->clip_x + w->clip_w || y >= w->clip_y + w->clip_h))
         return;
     if (x < 0 || y < 0 || x >= w->width || y >= w->height || alpha <= 0) return;
+    alpha = alpha * w->alpha / 255;
+    if (alpha <= 0) return;
     if (alpha >= 255) {
         w->backbuf[y * w->width + x] = 0xFF000000u | (rgb & 0x00FFFFFFu);
         return;
@@ -232,6 +429,11 @@ static inline void blend_argb(ag_window *w, int x, int y, ag_u32 rgb, int alpha)
     g = (g * alpha + dg * (255 - alpha)) / 255;
     b = (b * alpha + db * (255 - alpha)) / 255;
     w->backbuf[y * w->width + x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+static inline void blend_argb(ag_window *w, int x, int y, ag_u32 rgb, int alpha)
+{
+    blend_px(w, x + w->ox, y + w->oy, rgb, alpha);
 }
 
 static void ag_clip_set(ag_window *w, int x, int y, int cw, int ch)
@@ -475,11 +677,10 @@ static int ag_backend_glyph(ag_font *f, ag_u32 cp, struct ag_glyph *g);
 
 static const struct ag_glyph *ag_font_glyph(ag_font *f, ag_u32 cp)
 {
-    for (int i = 0; i < AG_GLYPH_CACHE; ++i)
-        if (f->cache[i].cp == cp) return &f->cache[i];
+    if (!cp) return NULL;
+    struct ag_glyph *slot = &f->cache[ag_glyph_slot(cp)];
+    if (slot->cp == cp && slot->bits) return slot;
 
-    struct ag_glyph *slot = &f->cache[f->cache_next];
-    f->cache_next = (f->cache_next + 1) % AG_GLYPH_CACHE;
     if (slot->bits) { free(slot->bits); memset(slot, 0, sizeof(*slot)); }
     slot->cp = cp;
     if (ag_backend_glyph(f, cp, slot) != 0) {
@@ -511,6 +712,15 @@ ag_image *ag_image_create(int w, int h)
     return im;
 }
 
+ag_image *ag_image_clone(const ag_image *img)
+{
+    if (!img || !img->pixels) return NULL;
+    ag_image *im = ag_image_create(img->w, img->h);
+    if (!im) return NULL;
+    memcpy(im->pixels, img->pixels, (size_t)img->w * img->h * sizeof(ag_u32));
+    return im;
+}
+
 void ag_image_destroy(ag_image *img)
 {
     if (!img) return;
@@ -524,6 +734,54 @@ int ag_image_get_size(const ag_image *img, int *w, int *h)
     if (w) *w = img->w;
     if (h) *h = img->h;
     return 0;
+}
+
+ag_u32 ag_image_pixel(const ag_image *img, int x, int y)
+{
+    if (!img || !img->pixels) return 0;
+    if (x < 0 || y < 0 || x >= img->w || y >= img->h) return 0;
+    return img->pixels[y * img->w + x];
+}
+
+int ag_image_save_png(const ag_image *img, const char *path)
+{
+    if (!img || !img->pixels || !path) return 0;
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png) { fclose(f); return 0; }
+    png_infop info = png_create_info_struct(png);
+    if (!info) { png_destroy_write_struct(&png, NULL); fclose(f); return 0; }
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_write_struct(&png, &info);
+        fclose(f);
+        return 0;
+    }
+
+    png_init_io(png, f);
+    png_set_IHDR(png, info, (png_uint_32)img->w, (png_uint_32)img->h, 8,
+                 PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+
+    png_bytep row = (png_bytep)malloc((size_t)img->w * 4);
+    if (!row) { png_destroy_write_struct(&png, &info); fclose(f); return 0; }
+    for (int y = 0; y < img->h; ++y) {
+        for (int x = 0; x < img->w; ++x) {
+            ag_u32 p = img->pixels[y * img->w + x];
+            row[x * 4 + 0] = (png_byte)((p >> 16) & 0xFF);
+            row[x * 4 + 1] = (png_byte)((p >> 8) & 0xFF);
+            row[x * 4 + 2] = (png_byte)(p & 0xFF);
+            row[x * 4 + 3] = (png_byte)((p >> 24) & 0xFF);
+        }
+        png_write_row(png, row);
+    }
+    free(row);
+    png_write_end(png, NULL);
+    png_destroy_write_struct(&png, &info);
+    fclose(f);
+    return 1;
 }
 
 static ag_image *ag_image_from_bmp(const unsigned char *d, size_t sz)
@@ -656,7 +914,7 @@ static void ag_jpg_error_exit(j_common_ptr cinfo)
     longjmp(err->setjmp_buffer, 1);
 }
 
-static ag_image *ag_image_from_jpg(const unsigned char *d, size_t sz)
+ag_image *ag_jpeg_decode_mem(const unsigned char *d, size_t sz)
 {
     if (sz < 2 || d[0] != 0xFF || d[1] != 0xD8) return NULL;
 
@@ -881,7 +1139,7 @@ static void ag_svg_collect_attr(void *ud, const char *name, size_t nlen,
             size_t rl = ag_base64_decode(clean, cl, raw);
             ag_image *im = NULL;
             if (fmt == 'p')      im = ag_image_from_png(raw, rl);
-            else if (fmt == 'j') im = ag_image_from_jpg(raw, rl);
+            else if (fmt == 'j') im = ag_jpeg_decode_mem(raw, rl);
             if (im) {
                 if (e->raster) ag_image_destroy(e->raster);
                 e->raster = im;
@@ -1110,7 +1368,7 @@ ag_image *ag_image_load(const char *path)
     if (sz >= 8 && buf[0] == 0x89 && buf[1] == 'P' && buf[2] == 'N' && buf[3] == 'G')
         im = ag_image_from_png(buf, sz);
     else if (sz >= 2 && buf[0] == 0xFF && buf[1] == 0xD8)
-        im = ag_image_from_jpg(buf, sz);
+        im = ag_jpeg_decode_mem(buf, sz);
     else if (sz > 0 && buf[0] == '<')
         im = ag_image_from_svg_mem(buf, sz, 1.0f);
     else
@@ -1135,7 +1393,28 @@ void ag_draw_image(ag_window *w, int x, int y, int wc, int hc, const ag_image *i
     if (hc <= 0) hc = img->h;
     if (wc == 0 || hc == 0) return;
 
-    if (wc == img->w && hc == img->h) {          
+    if (wc == img->w && hc == img->h) {
+        int opaque = 1;
+        for (int i = 0; i < wc * hc && opaque; ++i)
+            if ((img->pixels[i] >> 24) != 0xFF) opaque = 0;
+        if (opaque) {
+            for (int j = 0; j < hc; ++j) {
+                int dy = y + j;
+                if (dy < 0 || dy >= w->height) continue;
+                int dx0 = x < 0 ? -x : 0;
+                int dx1 = x + wc > w->width ? w->width - x : wc;
+                if (dx0 >= dx1) continue;
+                if (w->clip_on) {
+                    if (dx0 + x < w->clip_x) dx0 = w->clip_x - x;
+                    if (dx1 + x > w->clip_x + w->clip_w) dx1 = w->clip_x + w->clip_w - x;
+                    if (dx0 >= dx1) continue;
+                }
+                memcpy(w->backbuf + (size_t)dy * w->width + x + dx0,
+                       img->pixels + (size_t)j * img->w + dx0,
+                       (size_t)(dx1 - dx0) * sizeof(ag_u32));
+            }
+            return;
+        }
         for (int j = 0; j < hc; ++j)
             for (int i = 0; i < wc; ++i)
                 image_blend_px(w, x + i, y + j, img->pixels[j * img->w + i]);
@@ -1170,6 +1449,421 @@ void ag_draw_image(ag_window *w, int x, int y, int wc, int hc, const ag_image *i
     }
 }
 
+
+static inline ag_u32 ag_pm(ag_u32 p)
+{
+    unsigned a = p >> 24;
+    if (a == 255) return p;
+    unsigned r = ((p >> 16) & 0xFF) * a / 255u;
+    unsigned g = ((p >> 8)  & 0xFF) * a / 255u;
+    unsigned b = ( p        & 0xFF) * a / 255u;
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+static inline ag_u32 ag_unpm(ag_u32 p)
+{
+    unsigned a = p >> 24;
+    if (a == 0) return 0;
+    if (a == 255) return p;
+    unsigned r = ((p >> 16) & 0xFF) * 255u / a;
+    unsigned g = ((p >> 8)  & 0xFF) * 255u / a;
+    unsigned b = ( p        & 0xFF) * 255u / a;
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+static inline int ag_clampi(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static void kawase_down_rows(const ag_u32 *src, int sw, int sh,
+                             ag_u32 *dst, int dw, int dh, int off,
+                             int ry0, int ry1)
+{
+    (void)dh;
+    for (int y = ry0; y < ry1; ++y) {
+        int cy = y * 2;
+        int y0 = ag_clampi(cy - off, 0, sh - 1);
+        int y1 = ag_clampi(cy + off, 0, sh - 1);
+        const ag_u32 *rowc = src + (size_t)cy * sw;
+        const ag_u32 *row0 = src + (size_t)y0 * sw;
+        const ag_u32 *row1 = src + (size_t)y1 * sw;
+        ag_u32 *drow = dst + (size_t)y * dw;
+        for (int x = 0; x < dw; ++x) {
+            int cx = x * 2;
+            int x0 = ag_clampi(cx - off, 0, sw - 1);
+            int x1 = ag_clampi(cx + off, 0, sw - 1);
+            const ag_u32 *c = &rowc[cx];
+            const ag_u32 *a = &row0[x0];
+            const ag_u32 *b = &row0[x1];
+            const ag_u32 *d = &row1[x0];
+            const ag_u32 *e = &row1[x1];
+            ag_u32 out = 0;
+            for (int ch = 0; ch < 4; ++ch) {
+                int shift = 24 - ch * 8;
+                int sum = (int)((c[0] >> shift) & 0xFF) * 4 +
+                          (int)((a[0] >> shift) & 0xFF) +
+                          (int)((b[0] >> shift) & 0xFF) +
+                          (int)((d[0] >> shift) & 0xFF) +
+                          (int)((e[0] >> shift) & 0xFF);
+                out |= (ag_u32)((sum / 8) & 0xFF) << shift;
+            }
+            drow[x] = out;
+        }
+    }
+}
+
+static inline ag_u32 kawase_sample(const ag_u32 *src, int sw, int sh, int fx, int fy)
+{
+    int x0 = fx >> 16, y0 = fy >> 16;
+    int tx = fx & 0xFFFF, ty = fy & 0xFFFF;
+    if (x0 < 0) { x0 = 0; tx = 0; }
+    if (y0 < 0) { y0 = 0; ty = 0; }
+    if (x0 > sw - 1) { x0 = sw - 1; tx = 0; }
+    if (y0 > sh - 1) { y0 = sh - 1; ty = 0; }
+    int x1 = x0 + 1 < sw ? x0 + 1 : x0;
+    int y1 = y0 + 1 < sh ? y0 + 1 : y0;
+
+    const ag_u32 *p00 = &src[(size_t)y0 * sw + x0];
+    const ag_u32 *p10 = &src[(size_t)y0 * sw + x1];
+    const ag_u32 *p01 = &src[(size_t)y1 * sw + x0];
+    const ag_u32 *p11 = &src[(size_t)y1 * sw + x1];
+
+    int h0[4], h1[4];
+    for (int c = 0; c < 4; ++c) {
+        int sh2 = 24 - c * 8;
+        int a = (int)((p00[0] >> sh2) & 0xFF);
+        int b = (int)((p10[0] >> sh2) & 0xFF);
+        h0[c] = a + (((b - a) * tx) >> 16);
+        a = (int)((p01[0] >> sh2) & 0xFF);
+        b = (int)((p11[0] >> sh2) & 0xFF);
+        h1[c] = a + (((b - a) * tx) >> 16);
+    }
+    ag_u32 out = 0;
+    for (int c = 0; c < 4; ++c) {
+        int v = h0[c] + (((h1[c] - h0[c]) * ty) >> 16);
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        out |= (ag_u32)v << (24 - c * 8);
+    }
+    return out;
+}
+
+static void kawase_up_rows(const ag_u32 *src, int sw, int sh,
+                           ag_u32 *dst, int dw, int dh, int off,
+                           int ry0, int ry1)
+{
+    static const int tap_dx[8] = { -2, -1,  0,  1,  2,  1,  0, -1 };
+    static const int tap_dy[8] = {  0, -1, -2, -1,  0,  1,  2,  1 };
+    static const int tap_w[8]  = {  1,  2,  1,  2,  1,  2,  1,  2 };
+
+    for (int y = ry0; y < ry1; ++y) {
+        int sy = (int)((((float)y + 0.5f) * (float)sh / (float)dh - 0.5f) * 65536.0f);
+        ag_u32 *drow = dst + (size_t)y * dw;
+        for (int x = 0; x < dw; ++x) {
+            int sx = (int)((((float)x + 0.5f) * (float)sw / (float)dw - 0.5f) * 65536.0f);
+            int r = 0, g = 0, b = 0, a = 0;
+            for (int t = 0; t < 8; ++t) {
+                ag_u32 s = kawase_sample(src, sw, sh,
+                                         sx + tap_dx[t] * off * 65536,
+                                         sy + tap_dy[t] * off * 65536);
+                int w = tap_w[t];
+                r += (int)((s >> 16) & 0xFF) * w;
+                g += (int)((s >> 8) & 0xFF) * w;
+                b += (int)(s & 0xFF) * w;
+                a += (int)(s >> 24) * w;
+            }
+            ag_u32 out = 0;
+            out |= (ag_u32)ag_clampi(a / 12, 0, 255) << 24;
+            out |= (ag_u32)ag_clampi(r / 12, 0, 255) << 16;
+            out |= (ag_u32)ag_clampi(g / 12, 0, 255) << 8;
+            out |= (ag_u32)ag_clampi(b / 12, 0, 255);
+            drow[x] = out;
+        }
+    }
+}
+
+
+typedef struct {
+    const ag_u32 *src;
+    int   sw, sh;
+    ag_u32 *dst;
+    int   dw, dh, off;
+    int   rows;
+} kawase_job;
+
+static void kawase_down_work(void *ud, int index, int count)
+{
+    kawase_job *j = (kawase_job *)ud;
+    int rows = (j->dh + count - 1) / count;
+    int y0 = index * rows, y1 = y0 + rows;
+    if (y1 > j->dh) y1 = j->dh;
+    kawase_down_rows(j->src, j->sw, j->sh, j->dst, j->dw, j->dh, j->off, y0, y1);
+}
+
+static void kawase_up_work(void *ud, int index, int count)
+{
+    kawase_job *j = (kawase_job *)ud;
+    int rows = (j->dh + count - 1) / count;
+    int y0 = index * rows, y1 = y0 + rows;
+    if (y1 > j->dh) y1 = j->dh;
+    kawase_up_rows(j->src, j->sw, j->sh, j->dst, j->dw, j->dh, j->off, y0, y1);
+}
+
+typedef struct {
+    ag_u32 *px;
+    size_t  n;
+    int     mul;
+} ag_alpha_job;
+
+static void ag_alpha_work(void *ud, int index, int count)
+{
+    ag_alpha_job *j = (ag_alpha_job *)ud;
+    size_t chunk = (j->n + (size_t)count - 1) / (size_t)count;
+    size_t first = (size_t)index * chunk;
+    size_t last = first + chunk;
+    if (last > j->n) last = j->n;
+    if (j->mul) {
+        for (size_t i = first; i < last; ++i) j->px[i] = ag_pm(j->px[i]);
+    } else {
+        for (size_t i = first; i < last; ++i) j->px[i] = ag_unpm(j->px[i]);
+    }
+}
+
+int ag_image_blur_dual_kawase(ag_image *img, int radius, int passes)
+{
+    if (!img || !img->pixels || img->w < 2 || img->h < 2) return 0;
+    if (radius < 1) radius = 1;
+    if (radius > 64) radius = 64;
+    if (passes < 1) passes = 1;
+    if (passes > 4) passes = 4;
+
+    int levels = (radius + 1) / 2;
+    if (levels < 1) levels = 1;
+    if (levels > 8) levels = 8;
+
+    size_t n = (size_t)img->w * img->h;
+    ag_u32 *work = (ag_u32 *)malloc(n * sizeof(ag_u32));
+    if (!work) return 0;
+    memcpy(work, img->pixels, n * sizeof(ag_u32));
+
+    ag_alpha_job aj;
+    aj.px = work;
+    aj.n = n;
+    aj.mul = 1;
+    ag_parallel_for((int)((n + 63) / 64), ag_alpha_work, &aj);
+
+    int lw[9], lh[9];
+    lw[0] = img->w; lh[0] = img->h;
+    for (int i = 1; i <= levels; ++i) {
+        lw[i] = (lw[i - 1] + 1) / 2;
+        lh[i] = (lh[i - 1] + 1) / 2;
+    }
+
+    kawase_job job;
+    for (int p = 0; p < passes; ++p) {
+        ag_u32 *cur = work;
+        int cw = lw[0], ch = lh[0], owned = 0, built = 0;
+
+        for (int i = 1; i <= levels; ++i) {
+            ag_u32 *dn = (ag_u32 *)malloc((size_t)lw[i] * lh[i] * sizeof(ag_u32));
+            if (!dn) break;
+            job.src = cur; job.sw = cw; job.sh = ch;
+            job.dst = dn; job.dw = lw[i]; job.dh = lh[i]; job.off = 1;
+            ag_parallel_for(lh[i], kawase_down_work, &job);
+            if (owned) free(cur);
+            cur = dn; cw = lw[i]; ch = lh[i]; owned = 1; built = i;
+        }
+        for (int i = built; i >= 1; --i) {
+            ag_u32 *up = (ag_u32 *)malloc((size_t)lw[i - 1] * lh[i - 1] * sizeof(ag_u32));
+            if (!up) break;
+            job.src = cur; job.sw = cw; job.sh = ch;
+            job.dst = up; job.dw = lw[i - 1]; job.dh = lh[i - 1]; job.off = 1;
+            ag_parallel_for(lh[i - 1], kawase_up_work, &job);
+            if (owned) free(cur);
+            cur = up; cw = lw[i - 1]; ch = lh[i - 1]; owned = 1;
+        }
+        if (owned) {
+            memcpy(work, cur, n * sizeof(ag_u32));
+            free(cur);
+        }
+    }
+
+    aj.mul = 0;
+    ag_parallel_for((int)((n + 63) / 64), ag_alpha_work, &aj);
+
+    for (size_t i = 0; i < n; ++i) img->pixels[i] = work[i];
+    free(work);
+    return 1;
+}
+
+
+static void ag_box_h(ag_u32 *px, int w, int h, int r)
+{
+    if (r < 1) return;
+    int win = r * 2 + 1;
+    int inv = (65536 + win / 2) / win;
+    for (int y = 0; y < h; ++y) {
+        ag_u32 *row = px + (size_t)y * w;
+        long a[4] = { 0, 0, 0, 0 };
+        int first = 0;
+        for (int i = -r; i <= r; ++i) {
+            int j = i < 0 ? 0 : (i >= w ? w - 1 : i);
+            ag_u32 p = row[j];
+            a[0] += (p >> 16) & 0xFF;
+            a[1] += (p >> 8) & 0xFF;
+            a[2] += p & 0xFF;
+            a[3] += (p >> 24) & 0xFF;
+        }
+        for (int x = 0; x < w; ++x) {
+            row[x] = (ag_u32)(((a[3] * inv) >> 16) << 24) |
+                     (ag_u32)(((a[0] * inv) >> 16) << 16) |
+                     (ag_u32)(((a[1] * inv) >> 16) << 8) |
+                     (ag_u32)((a[2] * inv) >> 16);
+            int out = first - r < 0 ? 0 : (first - r >= w ? w - 1 : first - r);
+            int in  = first + r + 1 >= w ? w - 1 : first + r + 1;
+            ag_u32 po = row[out], pi = row[in];
+            a[0] += (int)((pi >> 16) & 0xFF) - (int)((po >> 16) & 0xFF);
+            a[1] += (int)((pi >> 8) & 0xFF) - (int)((po >> 8) & 0xFF);
+            a[2] += (int)(pi & 0xFF) - (int)(po & 0xFF);
+            a[3] += (int)((pi >> 24) & 0xFF) - (int)((po >> 24) & 0xFF);
+            ++first;
+        }
+    }
+}
+
+static void ag_box_v(ag_u32 *px, int w, int h, int r)
+{
+    if (r < 1) return;
+    int win = r * 2 + 1;
+    int inv = (65536 + win / 2) / win;
+    for (int x = 0; x < w; ++x) {
+        long a[4] = { 0, 0, 0, 0 };
+        int first = 0;
+        for (int i = -r; i <= r; ++i) {
+            int j = i < 0 ? 0 : (i >= h ? h - 1 : i);
+            ag_u32 p = px[(size_t)j * w + x];
+            a[0] += (p >> 16) & 0xFF;
+            a[1] += (p >> 8) & 0xFF;
+            a[2] += p & 0xFF;
+            a[3] += (p >> 24) & 0xFF;
+        }
+        for (int y = 0; y < h; ++y) {
+            ag_u32 *dst = px + (size_t)y * w + x;
+            *dst = (ag_u32)(((a[3] * inv) >> 16) << 24) |
+                  (ag_u32)(((a[0] * inv) >> 16) << 16) |
+                  (ag_u32)(((a[1] * inv) >> 16) << 8) |
+                  (ag_u32)((a[2] * inv) >> 16);
+            int out = first - r < 0 ? 0 : (first - r >= h ? h - 1 : first - r);
+            int in  = first + r + 1 >= h ? h - 1 : first + r + 1;
+            ag_u32 po = px[(size_t)out * w + x], pi = px[(size_t)in * w + x];
+            a[0] += (int)((pi >> 16) & 0xFF) - (int)((po >> 16) & 0xFF);
+            a[1] += (int)((pi >> 8) & 0xFF) - (int)((po >> 8) & 0xFF);
+            a[2] += (int)(pi & 0xFF) - (int)(po & 0xFF);
+            a[3] += (int)((pi >> 24) & 0xFF) - (int)((po >> 24) & 0xFF);
+            ++first;
+        }
+    }
+}
+
+int ag_image_blur_box(ag_image *img, int radius, int passes)
+{
+    if (!img || !img->pixels) return 0;
+    if (radius < 1) radius = 1;
+    if (radius > 128) radius = 128;
+    if (passes < 1) passes = 1;
+    if (passes > 4) passes = 4;
+
+    ag_u32 *tmp = (ag_u32 *)malloc((size_t)img->w * img->h * sizeof(ag_u32));
+    if (!tmp) return 0;
+    for (int p = 0; p < passes; ++p) {
+        memcpy(tmp, img->pixels, (size_t)img->w * img->h * sizeof(ag_u32));
+        ag_box_h(tmp, img->w, img->h, radius);
+        ag_box_v(tmp, img->w, img->h, radius);
+        memcpy(img->pixels, tmp, (size_t)img->w * img->h * sizeof(ag_u32));
+    }
+    free(tmp);
+    return 1;
+}
+
+static void ag_image_scale_row(ag_image *dst, const ag_image *src, int j)
+{
+    float v = (src->h > 1 && dst->h > 1)
+                  ? (float)j * (float)(src->h - 1) / (float)(dst->h - 1)
+                  : 0.0f;
+    int y0 = ag_clampi((int)v, 0, src->h - 1);
+    int y1 = ag_clampi(y0 + 1, 0, src->h - 1);
+    float fy = v - (float)y0;
+    ag_u32 *drow = dst->pixels + (size_t)j * dst->w;
+    for (int i = 0; i < dst->w; ++i) {
+        float u = (src->w > 1 && dst->w > 1)
+                      ? (float)i * (float)(src->w - 1) / (float)(dst->w - 1)
+                      : 0.0f;
+        int x0 = ag_clampi((int)u, 0, src->w - 1);
+        int x1 = ag_clampi(x0 + 1, 0, src->w - 1);
+        float fx = u - (float)x0;
+        ag_u32 p00 = src->pixels[(size_t)y0 * src->w + x0];
+        ag_u32 p10 = src->pixels[(size_t)y0 * src->w + x1];
+        ag_u32 p01 = src->pixels[(size_t)y1 * src->w + x0];
+        ag_u32 p11 = src->pixels[(size_t)y1 * src->w + x1];
+        ag_u32 out = 0;
+        for (int ch = 0; ch < 4; ++ch) {
+            int shift = 24 - ch * 8;
+            int c = (int)(((p00 >> shift) & 0xFF) * (1 - fx) * (1 - fy) +
+                          ((p10 >> shift) & 0xFF) * fx * (1 - fy) +
+                          ((p01 >> shift) & 0xFF) * (1 - fx) * fy +
+                          ((p11 >> shift) & 0xFF) * fx * fy);
+            out |= (ag_u32)ag_clampi(c, 0, 255) << shift;
+        }
+        drow[i] = out;
+    }
+}
+
+typedef struct {
+    ag_image *dst;
+    const ag_image *src;
+} ag_scale_job;
+
+static void ag_scale_work(void *ud, int index, int count)
+{
+    ag_scale_job *j = (ag_scale_job *)ud;
+    int rows = (j->dst->h + count - 1) / count;
+    int y0 = index * rows, y1 = y0 + rows;
+    if (y1 > j->dst->h) y1 = j->dst->h;
+    for (int y = y0; y < y1; ++y)
+        ag_image_scale_row(j->dst, j->src, y);
+}
+
+static void ag_image_scale_into(ag_image *dst, const ag_image *src)
+{
+    ag_scale_job job;
+    job.dst = dst;
+    job.src = src;
+    ag_parallel_for(dst->h, ag_scale_work, &job);
+}
+
+void ag_draw_image_blur(ag_window *w, int x, int y, int wc, int hc,
+                        const ag_image *img, int radius, int passes)
+{
+    if (!w || !img || !img->pixels) return;
+    if (wc <= 0) wc = img->w;
+    if (hc <= 0) hc = img->h;
+    if (wc <= 0 || hc <= 0) return;
+    if (radius <= 0) { ag_draw_image(w, x, y, wc, hc, img); return; }
+
+    ag_image *tmp = ag_image_create(wc, hc);
+    if (!tmp) { ag_draw_image(w, x, y, wc, hc, img); return; }
+    ag_image_scale_into(tmp, img);
+    ag_image_blur_dual_kawase(tmp, radius, passes);
+    ag_draw_image(w, x, y, wc, hc, tmp);
+    ag_image_destroy(tmp);
+}
+
 static const ag_ui_theme ag_default_theme = {
     AG_RGB(36,36,40),
     AG_RGB(46,46,52),
@@ -1192,10 +1886,43 @@ typedef enum {
     AG_WIDGET_SLIDER_T,
     AG_WIDGET_TOGGLE_T,
     AG_WIDGET_TEXTBOX_T,
-    AG_WIDGET_TEXTVIEW_T
+    AG_WIDGET_TEXTVIEW_T,
+    AG_WIDGET_IMAGE_T,
+    AG_WIDGET_VIDEO_T
 } ag_widget_kind;
 
 #define AG_WIDGET_SB_W 12
+
+typedef struct ag_blur_job {
+    ag_image *scaled;
+    const ag_image *src;
+    int  sw, sh;
+    int  dw, dh;
+    int  radius, passes;
+    int  gen;
+    int  done;
+    ag_image *result;
+} ag_blur_job;
+
+#if defined(_WIN32)
+#  define AG_TLS __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define AG_TLS __thread
+#else
+#  define AG_TLS
+#endif
+static AG_TLS ag_gl *g_blur_gl = NULL;
+static AG_TLS int g_blur_gl_tried = 0;
+static int g_gpu_blur_state = 0;
+
+static ag_gl *ag_blur_gl_get(void)
+{
+    if (g_blur_gl_tried) return g_blur_gl;
+    g_blur_gl_tried = 1;
+    g_blur_gl = ag_gl_create();
+    if (!g_blur_gl) g_gpu_blur_state = -1;
+    return g_blur_gl;
+}
 
 struct ag_widget {
     ag_widget_kind kind;
@@ -1205,17 +1932,43 @@ struct ag_widget {
     struct ag_widget *next;
     int hovered, pressed, focused;
     int removed;
+    int page;
+    int anim_delay;
     union {
         struct { char *label; } button;
         struct { float vmin, vmax, val; } slider;
         struct { char *label; int on; } toggle;
         struct { char *buf; int cap, len, cursor, submit; } textbox;
-        struct { char *buf; int cap, len;      
-                 int scroll;                   
-                 int max_scroll;               
-                 int sb_drag;                  
-                 int pinned;                   
+        struct { char *buf; int cap, len;
+                 int scroll;
+                 int max_scroll;
+                 int sb_drag;
+                 int pinned;
         } textview;
+        struct {
+            const ag_image *img;
+            char *caption;
+            int   blur_radius;
+            int   blur_passes;
+            ag_image *cache;
+            ag_image *cache_blur;
+            int   cache_w, cache_h;
+            int   cache_radius;
+            int   blur_gen;
+            const ag_image *cache_src;
+            int   gen;
+            struct ag_blur_job *job;
+            ag_thread *worker;
+        } image;
+        struct {
+            ag_video *video;
+            ag_image *frame;
+            char     *err;
+            int       playing;
+            int       seek_drag;
+            double    acc;
+            unsigned long last_tick;
+        } video;
     } u;
 };
 
@@ -1229,6 +1982,19 @@ struct ag_ui {
     struct ag_widget *pressed;
     ag_layout_cb resize_cb;
     void *resize_ud;
+
+    int  page;
+    int  page_from;
+    int  anim_type, anim_dur, anim_ease;
+    unsigned long anim_start;
+    int  anim_active;
+    ag_u32 *page_buf;
+    ag_u32 *page_buf_out;
+    int  page_buf_w, page_buf_h;
+    int  out_valid;
+    int  in_valid;
+    ag_page_draw_cb page_draw_cb;
+    void *page_draw_ud;
 };
 
 static int ui_text_height(ag_ui *ui)
@@ -1251,10 +2017,13 @@ static int ui_text_width(ag_ui *ui, const char *t)
 
 static struct ag_widget *ag_ui_widget_at(ag_ui *ui, int x, int y)
 {
-    for (struct ag_widget *wdg = ui->head; wdg; wdg = wdg->next)
-        if (!wdg->removed && x >= wdg->x && y >= wdg->y &&
+    for (struct ag_widget *wdg = ui->head; wdg; wdg = wdg->next) {
+        if (wdg->removed) continue;
+        if (wdg->page != ui->page && wdg->page != AG_PAGE_GLOBAL) continue;
+        if (x >= wdg->x && y >= wdg->y &&
             x < wdg->x + wdg->w && y < wdg->y + wdg->h)
             return wdg;
+    }
     return NULL;
 }
 
@@ -1270,6 +2039,26 @@ static void ag_ui_gc(ag_ui *ui)
             case AG_WIDGET_TOGGLE_T: free(cur->u.toggle.label); break;
             case AG_WIDGET_TEXTBOX_T: free(cur->u.textbox.buf); break;
             case AG_WIDGET_TEXTVIEW_T: free(cur->u.textview.buf); break;
+            case AG_WIDGET_IMAGE_T: {
+                free(cur->u.image.caption);
+                ag_image_destroy(cur->u.image.cache);
+                ag_image_destroy(cur->u.image.cache_blur);
+                if (cur->u.image.worker) {
+                    ag_thread_join(cur->u.image.worker);
+                    cur->u.image.worker = NULL;
+                }
+                if (cur->u.image.job) {
+                    ag_image_destroy(cur->u.image.job->scaled);
+                    ag_image_destroy(cur->u.image.job->result);
+                    free(cur->u.image.job);
+                    cur->u.image.job = NULL;
+                }
+                break;
+            }
+            case AG_WIDGET_VIDEO_T:
+                free(cur->u.video.err);
+                if (cur->u.video.video) ag_video_close(cur->u.video.video);
+                break;
             default: break;
             }
             if (ui->focused == cur) ui->focused = NULL;
@@ -1292,6 +2081,7 @@ ag_ui *ag_ui_create(ag_window *win)
     ui->font = ag_font_default(16);
     ui->font_owned = ui->font != NULL;
     ui->th = ag_default_theme;
+    win->ui = ui;
     return ui;
 }
 
@@ -1307,12 +2097,37 @@ void ag_ui_destroy(ag_ui *ui)
         case AG_WIDGET_TOGGLE_T: free(ui->head->u.toggle.label); break;
         case AG_WIDGET_TEXTBOX_T: free(ui->head->u.textbox.buf); break;
         case AG_WIDGET_TEXTVIEW_T: free(ui->head->u.textview.buf); break;
+        case AG_WIDGET_IMAGE_T: {
+            free(ui->head->u.image.caption);
+            ag_image_destroy(ui->head->u.image.cache);
+            ag_image_destroy(ui->head->u.image.cache_blur);
+            if (ui->head->u.image.worker) {
+                ag_thread_join(ui->head->u.image.worker);
+                ui->head->u.image.worker = NULL;
+            }
+            if (ui->head->u.image.job) {
+                ag_image_destroy(ui->head->u.image.job->scaled);
+                ag_image_destroy(ui->head->u.image.job->result);
+                free(ui->head->u.image.job);
+                ui->head->u.image.job = NULL;
+            }
+            break;
+        }
+        case AG_WIDGET_VIDEO_T:
+            free(ui->head->u.video.err);
+            if (ui->head->u.video.video) ag_video_close(ui->head->u.video.video);
+            break;
         default: break;
         }
         free(ui->head);
         ui->head = n;
     }
     ui->tail = &ui->head;
+    if (ui->win) ui->win->ui = NULL;
+    free(ui->page_buf);
+    free(ui->page_buf_out);
+    ui->page_buf = NULL;
+    ui->page_buf_out = NULL;
     if (ui->font && ui->font_owned) ag_font_close(ui->font);
     free(ui);
 }
@@ -1336,6 +2151,158 @@ void ag_ui_set_layout_cb(ag_ui *ui, ag_layout_cb cb, void *ud)
     if (!ui) return;
     ui->resize_cb = cb;
     ui->resize_ud = ud;
+}
+
+
+float ag_ease_apply(ag_ease ease, float t)
+{
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    switch (ease) {
+    case AG_EASE_LINEAR:
+        return t;
+    case AG_EASE_IN_QUAD:
+        return t * t;
+    case AG_EASE_OUT_QUAD:
+        return t * (2.0f - t);
+    case AG_EASE_IN_OUT_QUAD:
+        return t < 0.5f ? 2.0f * t * t : -1.0f + (4.0f - 2.0f * t) * t;
+    case AG_EASE_OUT_CUBIC: {
+        float f = t - 1.0f;
+        return f * f * f + 1.0f;
+    }
+    case AG_EASE_IN_OUT_CUBIC:
+        if (t < 0.5f) return 4.0f * t * t * t;
+        { float f = 2.0f * t - 2.0f; return f * f * f + 1.0f; }
+    case AG_EASE_OUT_BACK: {
+        const float c1 = 1.70158f, c3 = c1 + 1.0f;
+        float f = t - 1.0f;
+        return 1.0f + c3 * f * f * f + c1 * f * f;
+    }
+    case AG_EASE_OUT_ELASTIC: {
+        const float c4 = 6.2831853f / 3.0f;
+        if (t == 0.0f) return 0.0f;
+        if (t == 1.0f) return 1.0f;
+        return (float)(pow(2.0, -10.0 * t) * sin((t * 10.0 - 0.75) * c4)) + 1.0f;
+    }
+    case AG_EASE_OUT_BOUNCE: {
+        const float n1 = 7.5625f, d1 = 2.75f;
+        if (t < 1.0f / d1) return n1 * t * t;
+        if (t < 2.0f / d1) { t -= 1.5f / d1; return n1 * t * t + 0.75f; }
+        if (t < 2.5f / d1) { t -= 2.25f / d1; return n1 * t * t + 0.9375f; }
+        t -= 2.625f / d1;
+        return n1 * t * t + 0.984375f;
+    }
+    }
+    return t;
+}
+
+void ag_ui_set_transition(ag_ui *ui, ag_anim_type type, int duration_ms, ag_ease ease)
+{
+    if (!ui) return;
+    ui->anim_type = (int)type;
+    ui->anim_dur  = duration_ms > 0 ? duration_ms : 220;
+    ui->anim_ease = (int)ease;
+}
+
+void ag_ui_set_page(ag_ui *ui, int page)
+{
+    if (!ui) return;
+    if (page == ui->page) return;
+    ui->page_from = ui->page;
+    ui->page      = page;
+    ui->anim_start = ag_time_ms();
+    ui->anim_active = 1;
+    ui->out_valid = 0;
+    ui->in_valid = 0;
+    if (ui->win) ui->win->nlayers = 0;
+    ag_window_redraw(ui->win);
+}
+
+void ag_ui_set_page_draw_cb(ag_ui *ui, ag_page_draw_cb cb, void *ud)
+{
+    if (!ui) return;
+    ui->page_draw_cb = cb;
+    ui->page_draw_ud = ud;
+}
+
+int ag_ui_page(const ag_ui *ui) { return ui ? ui->page : 0; }
+
+int ag_ui_animating(const ag_ui *ui) { return ui ? ui->anim_active : 0; }
+
+static void ui_update_images(ag_ui *ui);
+
+static void ui_update_videos(ag_ui *ui)
+{
+    for (struct ag_widget *wdg = ui->head; wdg; wdg = wdg->next) {
+        if (wdg->removed || wdg->kind != AG_WIDGET_VIDEO_T) continue;
+        if (!wdg->u.video.video || !wdg->u.video.playing) continue;
+
+        unsigned long now = ag_time_ms();
+        if (wdg->u.video.last_tick == 0) { wdg->u.video.last_tick = now; continue; }
+        double dt = (double)(now - wdg->u.video.last_tick) / 1000.0;
+        wdg->u.video.last_tick = now;
+        if (dt < 0.0) dt = 0.0;
+        if (dt > 0.25) dt = 0.25;
+        wdg->u.video.acc += dt;
+
+        double fps = ag_video_fps(wdg->u.video.video);
+        if (fps <= 0.0) fps = 25.0;
+        double spf = 1.0 / fps;
+        int advanced = 0;
+
+        while (wdg->u.video.acc >= spf) {
+            wdg->u.video.acc -= spf;
+            if (ag_video_next_frame(wdg->u.video.video, &wdg->u.video.frame) == 0) {
+                ag_video_seek(wdg->u.video.video, 0.0);
+                if (ag_video_next_frame(wdg->u.video.video, &wdg->u.video.frame) == 0) {
+                    wdg->u.video.playing = 0;
+                    break;
+                }
+            }
+            advanced = 1;
+        }
+        if (advanced) ag_window_redraw(ui->win);
+    }
+}
+
+void ag_ui_update(ag_ui *ui)
+{
+    if (!ui) return;
+    if (ui->anim_active) {
+        unsigned long now = ag_time_ms();
+        unsigned long el = now - ui->anim_start;
+        if (el >= (unsigned long)ui->anim_dur) {
+            ui->anim_active  = 0;
+            ui->page_from    = ui->page;
+        }
+        ag_window_redraw(ui->win);
+    }
+    ui_update_videos(ui);
+    ui_update_images(ui);
+}
+
+void ag_widget_set_page(ag_widget *wdg, int page)
+{
+    if (wdg) wdg->page = page;
+}
+
+int ag_widget_page(const ag_widget *wdg) { return wdg ? wdg->page : 0; }
+
+void ag_widget_set_anim_delay(ag_widget *wdg, int ms)
+{
+    if (wdg) wdg->anim_delay = ms > 0 ? ms : 0;
+}
+
+static float ui_anim_progress(const ag_ui *ui)
+{
+    if (!ui->anim_active) return 1.0f;
+    unsigned long el = ag_time_ms() - ui->anim_start;
+    if (ui->anim_dur <= 0) return 1.0f;
+    float t = (float)el / (float)ui->anim_dur;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return ag_ease_apply((ag_ease)ui->anim_ease, t);
 }
 
 const ag_ui_theme *ag_ui_default_theme(void)
@@ -1439,16 +2406,119 @@ ag_widget *ag_ui_add_textview(ag_ui *ui, int x, int y, int w, int h)
     return wdg;
 }
 
+ag_widget *ag_ui_add_image(ag_ui *ui, const ag_image *img, int x, int y, int w, int h,
+                            ag_widget_cb cb, void *ud)
+{
+    if (!ui) return NULL;
+    struct ag_widget *wdg = (struct ag_widget *)ag_mem_alloc(sizeof(*wdg));
+    if (!wdg) return NULL;
+    wdg->kind = AG_WIDGET_IMAGE_T;
+    wdg->x = x; wdg->y = y; wdg->w = w; wdg->h = h;
+    wdg->cb = cb; wdg->ud = ud;
+    wdg->u.image.img = img;
+    wdg->u.image.caption = NULL;
+    wdg->u.image.blur_radius = 0;
+    wdg->u.image.blur_passes = 1;
+    ag_widget_add(ui, wdg);
+    return wdg;
+}
+
+ag_widget *ag_ui_add_video(ag_ui *ui, const char *path, int x, int y, int w, int h,
+                            ag_widget_cb cb, void *ud)
+{
+    if (!ui) return NULL;
+    struct ag_widget *wdg = (struct ag_widget *)ag_mem_alloc(sizeof(*wdg));
+    if (!wdg) return NULL;
+    wdg->kind = AG_WIDGET_VIDEO_T;
+    wdg->x = x; wdg->y = y; wdg->w = w; wdg->h = h;
+    wdg->cb = cb; wdg->ud = ud;
+    wdg->u.video.video = path ? ag_video_open(path) : NULL;
+    wdg->u.video.frame = NULL;
+    wdg->u.video.err = NULL;
+    wdg->u.video.playing = 0;
+    wdg->u.video.seek_drag = 0;
+    wdg->u.video.acc = 0.0;
+    wdg->u.video.last_tick = 0;
+    if (!wdg->u.video.video) {
+        const char *e = ag_video_last_error();
+        wdg->u.video.err = strdup(e && *e ? e : "видео недоступно");
+    } else {
+        ag_video_next_frame(wdg->u.video.video, &wdg->u.video.frame);
+    }
+    ag_widget_add(ui, wdg);
+    return wdg;
+}
+
+void ag_widget_set_blur(ag_widget *wdg, int radius, int passes)
+{
+    if (!wdg || wdg->kind != AG_WIDGET_IMAGE_T) return;
+    wdg->u.image.blur_radius = radius > 0 ? radius : 0;
+    wdg->u.image.blur_passes = passes > 0 ? passes : 1;
+    wdg->u.image.gen++;
+}
+
+void ag_widget_set_image(ag_widget *wdg, const ag_image *img)
+{
+    if (!wdg || wdg->kind != AG_WIDGET_IMAGE_T) return;
+    wdg->u.image.img = img;
+    wdg->u.image.gen++;
+}
+
+void ag_widget_set_caption(ag_widget *wdg, const char *text)
+{
+    if (!wdg || wdg->kind != AG_WIDGET_IMAGE_T) return;
+    free(wdg->u.image.caption);
+    wdg->u.image.caption = text ? strdup(text) : NULL;
+}
+
+int  ag_video_widget_playing(ag_widget *wdg)
+{
+    if (!wdg || wdg->kind != AG_WIDGET_VIDEO_T) return 0;
+    return wdg->u.video.playing;
+}
+
+void ag_video_widget_play(ag_widget *wdg, int play)
+{
+    if (!wdg || wdg->kind != AG_WIDGET_VIDEO_T) return;
+    wdg->u.video.playing = play ? 1 : 0;
+    wdg->u.video.acc = 0.0;
+    wdg->u.video.last_tick = ag_time_ms();
+    if (wdg->u.video.video)
+        ag_video_set_playing(wdg->u.video.video, play);
+}
+
+void ag_video_widget_seek(ag_widget *wdg, double seconds)
+{
+    if (!wdg || wdg->kind != AG_WIDGET_VIDEO_T) return;
+    if (!wdg->u.video.video) return;
+    ag_video_seek(wdg->u.video.video, seconds);
+    ag_video_next_frame(wdg->u.video.video, &wdg->u.video.frame);
+    wdg->u.video.acc = 0.0;
+}
+
+double ag_video_widget_time(const ag_widget *wdg)
+{
+    if (!wdg || wdg->kind != AG_WIDGET_VIDEO_T) return 0.0;
+    return ag_video_time(wdg->u.video.video);
+}
+
 void ag_widget_remove(ag_ui *ui, ag_widget *wdg)
 {
     if (!ui || !wdg) return;
     wdg->removed = 1;
 }
 
+static void ag_widget_invalidate(ag_widget *wdg)
+{
+    if (!wdg) return;
+    if (wdg->kind == AG_WIDGET_IMAGE_T) wdg->u.image.gen++;
+}
+
 void ag_widget_move(ag_widget *wdg, int x, int y)
 {
     if (!wdg) return;
     wdg->x = x; wdg->y = y;
+    ag_widget_invalidate(wdg);
 }
 
 void ag_widget_set_rect(ag_widget *wdg, int x, int y, int w, int h)
@@ -1457,6 +2527,7 @@ void ag_widget_set_rect(ag_widget *wdg, int x, int y, int w, int h)
     if (w < 1) w = 1;
     if (h < 1) h = 1;
     wdg->x = x; wdg->y = y; wdg->w = w; wdg->h = h;
+    ag_widget_invalidate(wdg);
 }
 
 void ag_widget_get_rect(const ag_widget *wdg, int *x, int *y, int *w, int *h)
@@ -1934,27 +3005,573 @@ static void ui_draw_textview(ag_ui *ui, ag_widget *wdg)
     }
 }
 
+
+static void ag_blur_worker(void *ud)
+{
+    ag_blur_job *job = (ag_blur_job *)ud;
+    ag_image *res = NULL;
+
+    ag_gl *gl = ag_blur_gl_get();
+    if (gl && job->src && job->src->pixels) {
+        int bw = job->dw / 2, bh = job->dh / 2;
+        if (bw < 1) bw = 1;
+        if (bh < 1) bh = 1;
+        unsigned char *rgba = (unsigned char *)malloc((size_t)bw * bh * 4);
+        if (rgba) {
+            if (ag_gl_blur(gl, job->src->pixels, job->sw, job->sh,
+                           bw, bh, job->radius, rgba)) {
+                res = ag_image_create(bw, bh);
+                if (res) {
+                    for (int y = 0; y < bh; ++y) {
+                        const unsigned char *row = rgba + (size_t)y * bw * 4;
+                        ag_u32 *dst = res->pixels + (size_t)y * bw;
+                        for (int x = 0; x < bw; ++x) {
+                            dst[x] = ((ag_u32)row[x * 4 + 3] << 24) |
+                                     ((ag_u32)row[x * 4 + 0] << 16) |
+                                     ((ag_u32)row[x * 4 + 1] << 8) |
+                                     (ag_u32)row[x * 4 + 2];
+                        }
+                    }
+                }
+            }
+            free(rgba);
+        }
+        if (res) g_gpu_blur_state = 1;
+    }
+
+    if (!res && job->scaled) {
+        res = ag_image_clone(job->scaled);
+        if (res) ag_image_blur_box(res, job->radius, 2);
+    }
+    job->result = res;
+    job->done = 1;
+}
+
+static const ag_image *ui_image_cache(ag_widget *wdg)
+{
+    const ag_image *im = wdg->u.image.img;
+    if (!im || !im->pixels) return NULL;
+    if (g_gpu_blur_state > 0) return NULL;
+    if (wdg->u.image.cache && wdg->u.image.cache_src == im &&
+        wdg->u.image.cache_w == wdg->w && wdg->u.image.cache_h == wdg->h)
+        return wdg->u.image.cache;
+
+    ag_image *c = ag_image_create(wdg->w, wdg->h);
+    if (!c) return NULL;
+    ag_image_scale_into(c, im);
+    ag_image_destroy(wdg->u.image.cache);
+    wdg->u.image.cache = c;
+    wdg->u.image.cache_src = im;
+    wdg->u.image.cache_w = wdg->w;
+    wdg->u.image.cache_h = wdg->h;
+    wdg->u.image.gen++;
+    return c;
+}
+
+static const ag_image *ui_image_blur(ag_widget *wdg)
+{
+    if (wdg->u.image.blur_radius <= 0) return NULL;
+    return wdg->u.image.cache_blur;
+}
+
+static void ui_update_images(ag_ui *ui)
+{
+    int changed = 0;
+
+    for (struct ag_widget *wdg = ui->head; wdg; wdg = wdg->next) {
+        if (wdg->removed || wdg->kind != AG_WIDGET_IMAGE_T) continue;
+        if (wdg->page != ui->page && wdg->page != AG_PAGE_GLOBAL) continue;
+
+        ag_blur_job *job = wdg->u.image.job;
+        if (job) {
+            if (!job->done) continue;
+            if (wdg->u.image.worker) {
+                ag_thread_join(wdg->u.image.worker);
+                wdg->u.image.worker = NULL;
+            }
+            if (job->gen == wdg->u.image.gen && job->result) {
+                ag_image_destroy(wdg->u.image.cache_blur);
+                wdg->u.image.cache_blur = job->result;
+                job->result = NULL;
+                wdg->u.image.cache_radius = job->radius;
+                wdg->u.image.blur_gen = job->gen;
+                changed = 1;
+            }
+            ag_image_destroy(job->scaled);
+            free(job);
+            wdg->u.image.job = NULL;
+        }
+
+        if (wdg->u.image.blur_radius > 0 && !wdg->u.image.job &&
+            wdg->u.image.blur_gen != wdg->u.image.gen) {
+            const ag_image *src = wdg->u.image.img;
+            const ag_image *scaled = ui_image_cache(wdg);
+            if (src && src->pixels) {
+                ag_blur_job *nj = (ag_blur_job *)calloc(1, sizeof(ag_blur_job));
+                if (nj) {
+                    nj->src    = src;
+                    nj->sw     = src->w;
+                    nj->sh     = src->h;
+                    nj->dw     = wdg->w;
+                    nj->dh     = wdg->h;
+                    nj->scaled = scaled ? ag_image_clone(scaled) : NULL;
+                    nj->radius = wdg->u.image.blur_radius;
+                    nj->passes = wdg->u.image.blur_passes;
+                    nj->gen    = wdg->u.image.gen;
+                    wdg->u.image.worker = ag_thread_start(ag_blur_worker, nj);
+                    if (wdg->u.image.worker) {
+                        wdg->u.image.job = nj;
+                    } else {
+                        ag_image_destroy(nj->scaled);
+                        free(nj);
+                    }
+                }
+            }
+        }
+    }
+    if (changed) ag_window_redraw(ui->win);
+}
+
+static void ui_draw_image_card(ag_ui *ui, struct ag_widget *wdg)
+{
+    ag_window *win = ui->win;
+    const ag_image *im = wdg->u.image.img;
+
+    if (im && im->pixels) {
+        const ag_image *pic = ui_image_blur(wdg);
+        if (!pic) pic = im;
+        if (pic) ag_draw_image(win, wdg->x, wdg->y, wdg->w, wdg->h, pic);
+    } else {
+        ag_set_color(win, ui->th.bg2);
+        ag_fill_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
+    }
+
+    if (wdg->u.image.caption && *wdg->u.image.caption) {
+        int fh = ui_text_height(ui);
+        int strip = fh + 6;
+        int sy = wdg->y + wdg->h - strip;
+        if (sy < wdg->y) sy = wdg->y;
+        int oa = win->alpha;
+        win->alpha = oa * 3 / 4;
+        ag_set_color(win, AG_RGB(0, 0, 0));
+        ag_fill_rect(win, wdg->x, sy, wdg->w, strip);
+        win->alpha = oa;
+        ag_set_color(win, AG_WHITE);
+        ui_draw_text(ui, wdg->x + 6, sy + 3, wdg->u.image.caption);
+    }
+
+    if (ui->th.borders) {
+        ag_set_color(win, ui->th.border);
+        ag_draw_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
+    }
+}
+
+void ag_widget_prepare(ag_widget *wdg)
+{
+    if (!wdg) return;
+    if (wdg->kind == AG_WIDGET_IMAGE_T) {
+        const ag_image *scaled = ui_image_cache(wdg);
+        if (scaled && wdg->u.image.blur_radius > 0) {
+            ag_image *b = ag_image_clone(scaled);
+            if (b) {
+                ag_image_blur_box(b, wdg->u.image.blur_radius, 2);
+                ag_image_destroy(wdg->u.image.cache_blur);
+                wdg->u.image.cache_blur = b;
+                wdg->u.image.cache_radius = wdg->u.image.blur_radius;
+                wdg->u.image.blur_gen = wdg->u.image.gen;
+            }
+        }
+    }
+}
+
+#define UI_VIDEO_BAR 28
+
+static void ui_video_time_str(char *buf, int cap, double t)
+{
+    int total = (int)t;
+    int m = total / 60, s = total % 60;
+    int ms = (int)((t - (double)total) * 100.0);
+    snprintf(buf, (size_t)cap, "%d:%02d.%02d", m, s, ms);
+}
+
+static void ui_draw_video(ag_ui *ui, struct ag_widget *wdg)
+{
+    ag_window *win = ui->win;
+    int bar = wdg->h > UI_VIDEO_BAR * 2 ? UI_VIDEO_BAR : 0;
+    int vh = wdg->h - bar;
+    if (vh < 1) vh = 1;
+
+    ag_set_color(win, AG_RGB(10, 10, 14));
+    ag_fill_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
+
+    const ag_image *fr = wdg->u.video.frame;
+    if (fr && fr->pixels) {
+        int iw = 0, ih = 0;
+        ag_image_get_size(fr, &iw, &ih);
+        if (iw > 0 && ih > 0) {
+            float k = (float)wdg->w / (float)iw;
+            float kh = (float)vh / (float)ih;
+            if (kh < k) k = kh;
+            int dw = (int)((float)iw * k), dh = (int)((float)ih * k);
+            if (dw < 1) dw = 1;
+            if (dh < 1) dh = 1;
+            int dx = wdg->x + (wdg->w - dw) / 2;
+            int dy = wdg->y + (vh - dh) / 2;
+            ag_draw_image(win, dx, dy, dw, dh, fr);
+        }
+    } else if (wdg->u.video.err && *wdg->u.video.err) {
+        ag_set_color(win, ui->th.text);
+        ui_draw_text(ui, wdg->x + 8, wdg->y + 8, wdg->u.video.err);
+    }
+
+    if (bar > 0) {
+        int by = wdg->y + vh;
+        ag_set_color(win, ui->th.bg2);
+        ag_fill_rect(win, wdg->x, by, wdg->w, bar);
+
+        int bx = wdg->x + 6, byy = by + (bar - 18) / 2;
+        ag_set_color(win, ui->th.accent);
+        if (wdg->u.video.playing) {
+            ag_fill_rect(win, bx, byy, 5, 18);
+            ag_fill_rect(win, bx + 9, byy, 5, 18);
+        } else {
+            for (int i = 0; i < 9; ++i) {
+                int hgt = 18 - i * 2;
+                ag_fill_rect(win, bx + i, byy + (18 - hgt) / 2, 1, hgt);
+            }
+        }
+
+        int sx = bx + 22;
+        int sw = wdg->w - (sx - wdg->x) - 66;
+        if (sw > 20) {
+            int sy2 = by + bar / 2 - 2;
+            ag_set_color(win, ui->th.track);
+            ag_fill_rect(win, sx, sy2, sw, 4);
+            double dur = ag_video_duration(wdg->u.video.video);
+            double cur = ag_video_time(wdg->u.video.video);
+            if (dur > 0.0) {
+                int p = (int)(sw * (cur / dur));
+                if (p < 0) p = 0;
+                if (p > sw) p = sw;
+                ag_set_color(win, ui->th.accent);
+                ag_fill_rect(win, sx, sy2, p, 4);
+                ag_fill_round_rect(win, sx + p - 3, by + 2, 6, bar - 4, 3);
+            }
+        }
+
+        char ts[32];
+        double cur = ag_video_time(wdg->u.video.video);
+        double dur = ag_video_duration(wdg->u.video.video);
+        ui_video_time_str(ts, sizeof(ts), cur);
+        ag_set_color(win, ui->th.text);
+        int tw = ui_text_width(ui, ts);
+        ui_draw_text(ui, wdg->x + wdg->w - tw - 8, by + (bar - ui_text_height(ui)) / 2, ts);
+        (void)dur;
+    }
+
+    if (ui->th.borders) {
+        ag_set_color(win, ui->th.border);
+        ag_draw_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
+    }
+}
+
+static void ui_video_seek_at(ag_widget *wdg, int x)
+{
+    if (!wdg || wdg->kind != AG_WIDGET_VIDEO_T || !wdg->u.video.video) return;
+    if (wdg->h <= UI_VIDEO_BAR * 2) return;
+    int sx = wdg->x + 6 + 22;
+    int sw = wdg->w - (sx - wdg->x) - 66;
+    if (sw <= 20) return;
+    double t = (double)(x - sx) / (double)sw;
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+    ag_video_widget_seek(wdg, ag_video_duration(wdg->u.video.video) * t);
+}
+
+
+static void ui_draw_widget(ag_ui *ui, struct ag_widget *wdg)
+{
+    switch (wdg->kind) {
+    case AG_WIDGET_BUTTON_T:  ui_draw_button(ui, wdg); break;
+    case AG_WIDGET_SLIDER_T:  ui_draw_slider(ui, wdg); break;
+    case AG_WIDGET_TOGGLE_T:  ui_draw_toggle(ui, wdg); break;
+    case AG_WIDGET_TEXTBOX_T: ui_draw_textbox(ui, wdg); break;
+    case AG_WIDGET_TEXTVIEW_T:ui_draw_textview(ui, wdg); break;
+    case AG_WIDGET_IMAGE_T:   ui_draw_image_card(ui, wdg); break;
+    case AG_WIDGET_VIDEO_T:   ui_draw_video(ui, wdg); break;
+    }
+}
+
+static void ui_render_page(ag_ui *ui, int page, int incoming, float prog)
+{
+    ag_window *win = ui->win;
+    int oa = win->alpha;
+
+    for (struct ag_widget *wdg = ui->head; wdg; wdg = wdg->next) {
+        if (wdg->removed || wdg->page != page) continue;
+
+        float p = prog;
+        if (wdg->anim_delay > 0 && ui->anim_dur > 0) {
+            float d = (float)wdg->anim_delay / (float)ui->anim_dur;
+            if (d > 0.99f) d = 0.99f;
+            p = (p - d) / (1.0f - d);
+            if (p < 0.0f) p = 0.0f;
+            if (p > 1.0f) p = 1.0f;
+        }
+        float a = incoming ? p : (1.0f - p);
+        if (a <= 0.002f) continue;
+
+        win->alpha = (int)(a * 255.0f + 0.5f);
+        ui_draw_widget(ui, wdg);
+    }
+    win->alpha = oa;
+
+    if (ui->page_draw_cb) ui->page_draw_cb(ui, page, ui->page_draw_ud);
+}
+
+static int ui_page_buf_ensure(ag_ui *ui, int w, int h)
+{
+    if (ui->page_buf && ui->page_buf_w == w && ui->page_buf_h == h) return 1;
+    ag_u32 *nb = (ag_u32 *)realloc(ui->page_buf, (size_t)w * h * sizeof(ag_u32));
+    if (!nb) { ui->page_buf = NULL; ui->page_buf_w = ui->page_buf_h = 0; return 0; }
+    ui->page_buf = nb;
+    ag_u32 *ob = (ag_u32 *)realloc(ui->page_buf_out, (size_t)w * h * sizeof(ag_u32));
+    if (!ob) { ui->page_buf_out = NULL; ui->out_valid = 0; }
+    else ui->page_buf_out = ob;
+    ui->page_buf_w = w;
+    ui->page_buf_h = h;
+    ui->out_valid = 0;
+    ui->in_valid = 0;
+    memset(nb, 0, (size_t)w * h * sizeof(ag_u32));
+    if (ob) memset(ob, 0, (size_t)w * h * sizeof(ag_u32));
+    return 1;
+}
+
+static void ui_blend_premul(ag_window *w, int x, int y, ag_u32 p, int ga)
+{
+    x += w->ox;
+    y += w->oy;
+    if (w->clip_on &&
+        (x < w->clip_x || y < w->clip_y ||
+         x >= w->clip_x + w->clip_w || y >= w->clip_y + w->clip_h))
+        return;
+    if (x < 0 || y < 0 || x >= w->width || y >= w->height) return;
+
+    unsigned pa = (p >> 24) & 0xFF;
+    int fa = (int)((unsigned)pa * (unsigned)ga / 255u);
+    if (fa <= 0) return;
+
+    ag_u32 *d = &w->backbuf[y * w->width + x];
+    int dr = (int)((*d >> 16) & 0xFF);
+    int dg = (int)((*d >> 8) & 0xFF);
+    int db = (int)((*d) & 0xFF);
+    int pr = (int)((p >> 16) & 0xFF);
+    int pg = (int)((p >> 8) & 0xFF);
+    int pb = (int)((p) & 0xFF);
+    int r = (int)((unsigned)pr * (unsigned)ga / 255u) + dr * (255 - fa) / 255;
+    int g = (int)((unsigned)pg * (unsigned)ga / 255u) + dg * (255 - fa) / 255;
+    int b = (int)((unsigned)pb * (unsigned)ga / 255u) + db * (255 - fa) / 255;
+    *d = 0xFF000000u | ((ag_u32)ag_clampi(r, 0, 255) << 16) |
+         ((ag_u32)ag_clampi(g, 0, 255) << 8) | (ag_u32)ag_clampi(b, 0, 255);
+}
+
+static void ui_page_composite(ag_window *w, const ag_u32 *buf, int bw, int bh,
+                              float alpha, float sx, float sy, int ox, int oy)
+{
+    int ga = (int)(alpha * 255.0f + 0.5f);
+    if (ga <= 0) return;
+    if (ga > 255) ga = 255;
+    if (sx < 0.001f || sy < 0.001f) return;
+    float cx = (float)bw * 0.5f, cy = (float)bh * 0.5f;
+
+    if (sx == 1.0f && sy == 1.0f) {
+        for (int y = 0; y < bh; ++y) {
+            for (int x = 0; x < bw; ++x) {
+                ag_u32 p = buf[(size_t)y * bw + x];
+                if (!((p >> 24) & 0xFF)) continue;
+                ui_blend_premul(w, x + ox, y + oy, p, ga);
+            }
+        }
+        return;
+    }
+
+    int fdx = (int)(65536.0f / sx);
+    int fdy = (int)(65536.0f / sy);
+    int fx0 = (int)(((-(float)ox - cx) / sx + cx) * 65536.0f);
+    int fy0 = (int)(((-(float)oy - cy) / sy + cy) * 65536.0f);
+    int maxx = bw << 16, maxy = bh << 16;
+
+    for (int y = 0; y < w->height; ++y) {
+        int fy = fy0 + y * fdy;
+        if (fy < 0 || fy > maxy) continue;
+        int fx = fx0;
+        for (int x = 0; x < w->width; ++x) {
+            if (fx >= 0 && fx <= maxx) {
+                int nx = fx >> 16, ny = fy >> 16;
+                ag_u32 p = buf[(size_t)ny * bw + nx];
+                if ((p >> 24) & 0xFF)
+                    ui_blend_premul(w, x, y, p, ga);
+            }
+            fx += fdx;
+        }
+    }
+}
+
+static int ag_window_gpu_layers(ag_window *w)
+{
+#if defined(_WIN32) || defined(AG_USE_WAYLAND)
+    (void)w;
+    return 0;
+#else
+    return w && w->present != NULL;
+#endif
+}
+
+static void ui_layer_params(ag_ui *ui, int incoming, float p,
+                            float *alpha, float *sx, float *sy,
+                            int *ox, int *oy)
+{
+    int bw = ui->page_buf_w, bh = ui->page_buf_h;
+
+    float vis = incoming ? p : (1.0f - p);
+    *alpha = vis;
+    *sx = 1.0f;
+    *sy = 1.0f;
+    *ox = 0;
+    *oy = 0;
+
+    switch (ui->anim_type) {
+    case AG_ANIM_FADE:
+        break;
+    case AG_ANIM_SLIDE_LEFT:
+        *ox = incoming ? (int)((1.0f - p) * (float)bw)
+                       : -(int)(p * (float)bw);
+        break;
+    case AG_ANIM_SLIDE_RIGHT:
+        *ox = incoming ? -(int)((1.0f - p) * (float)bw)
+                       : (int)(p * (float)bw);
+        break;
+    case AG_ANIM_SLIDE_UP:
+        *oy = incoming ? (int)((1.0f - p) * (float)bh)
+                       : -(int)(p * (float)bh);
+        break;
+    case AG_ANIM_SLIDE_DOWN:
+        *oy = incoming ? -(int)((1.0f - p) * (float)bh)
+                       : (int)(p * (float)bh);
+        break;
+    case AG_ANIM_SCALE:
+        *sx = *sy = incoming ? (0.92f + 0.08f * p) : (1.0f + 0.08f * p);
+        break;
+    case AG_ANIM_FLIP:
+        *sx = incoming ? p : (1.0f - p);
+        *sy = 1.0f;
+        break;
+    }
+}
+
+static void ui_composite_buf(ag_ui *ui, const ag_u32 *buf, int incoming, float p)
+{
+    ag_window *win = ui->win;
+    int bw = ui->page_buf_w, bh = ui->page_buf_h;
+    if (!buf || bw <= 0 || bh <= 0) return;
+
+    float alpha, sx, sy;
+    int ox, oy;
+    ui_layer_params(ui, incoming, p, &alpha, &sx, &sy, &ox, &oy);
+    ui_page_composite(win, buf, bw, bh, alpha, sx, sy, ox, oy);
+}
+
 void ag_ui_draw(ag_ui *ui)
 {
     if (!ui || !ui->win) return;
     ag_window *win = ui->win;
     ag_color oc = win->current_color;
     int ofs = win->font_size;
+    int oa = win->alpha;
 
     ag_ui_gc(ui);
-    for (struct ag_widget *wdg = ui->head; wdg; wdg = wdg->next) {
-        if (wdg->removed) continue;
-        switch (wdg->kind) {
-        case AG_WIDGET_BUTTON_T: ui_draw_button(ui, wdg); break;
-        case AG_WIDGET_SLIDER_T: ui_draw_slider(ui, wdg); break;
-        case AG_WIDGET_TOGGLE_T: ui_draw_toggle(ui, wdg); break;
-        case AG_WIDGET_TEXTBOX_T: ui_draw_textbox(ui, wdg); break;
-        case AG_WIDGET_TEXTVIEW_T: ui_draw_textview(ui, wdg); break;
+
+    if (ui->anim_active && win->width > 0 && win->height > 0 &&
+        ui_page_buf_ensure(ui, win->width, win->height) && ui->page_buf_out) {
+        float p = ui_anim_progress(ui);
+
+        if (!ui->out_valid) {
+            memset(ui->page_buf_out, 0,
+                   (size_t)ui->page_buf_w * ui->page_buf_h * sizeof(ag_u32));
+            win->rt = ui->page_buf_out;
+            win->rt_w = ui->page_buf_w;
+            win->rt_h = ui->page_buf_h;
+            ui_render_page(ui, ui->page_from, 1, 1.0f);
+            win->rt = NULL;
+            ui->out_valid = 1;
         }
+        int gpu = ag_window_gpu_layers(win);
+        ag_gl_layer layers[2];
+        float a0, sx0, sy0, a1, sx1, sy1;
+        int ox0, oy0, ox1, oy1;
+        ui_layer_params(ui, 0, p, &a0, &sx0, &sy0, &ox0, &oy0);
+        ui_layer_params(ui, 1, p, &a1, &sx1, &sy1, &ox1, &oy1);
+
+        if (gpu) {
+            layers[0].pixels = ui->page_buf_out;
+            layers[0].w = ui->page_buf_w;
+            layers[0].h = ui->page_buf_h;
+            layers[0].alpha = a0;
+            layers[0].scale = sx0;
+            layers[0].ox = ox0;
+            layers[0].oy = oy0;
+            layers[0].dirty = !ui->out_valid;
+        } else {
+            ui_composite_buf(ui, ui->page_buf_out, 0, p);
+        }
+
+        int stagger = 0;
+        for (struct ag_widget *wg = ui->head; wg; wg = wg->next)
+            if (!wg->removed && wg->page == ui->page && wg->anim_delay > 0) stagger = 1;
+
+        if (stagger || !ui->in_valid) {
+            memset(ui->page_buf, 0,
+                   (size_t)ui->page_buf_w * ui->page_buf_h * sizeof(ag_u32));
+            win->rt = ui->page_buf;
+            win->rt_w = ui->page_buf_w;
+            win->rt_h = ui->page_buf_h;
+            ui_render_page(ui, ui->page, 1, stagger ? p : 1.0f);
+            win->rt = NULL;
+            ui->in_valid = !stagger;
+        }
+
+        if (gpu) {
+            layers[1].pixels = ui->page_buf;
+            layers[1].w = ui->page_buf_w;
+            layers[1].h = ui->page_buf_h;
+            layers[1].alpha = a1;
+            layers[1].scale = sx1;
+            layers[1].ox = ox1;
+            layers[1].oy = oy1;
+            layers[1].dirty = 1;
+            win->layers[0] = layers[0];
+            win->layers[1] = layers[1];
+            win->nlayers = 2;
+        } else {
+            ui_composite_buf(ui, ui->page_buf, 1, p);
+        }
+
+        for (struct ag_widget *wdg = ui->head; wdg; wdg = wdg->next) {
+            if (wdg->removed || wdg->page != AG_PAGE_GLOBAL) continue;
+            ui_draw_widget(ui, wdg);
+        }
+    } else {
+        for (struct ag_widget *wdg = ui->head; wdg; wdg = wdg->next) {
+            if (wdg->removed) continue;
+            if (wdg->page != ui->page && wdg->page != AG_PAGE_GLOBAL) continue;
+            ui_draw_widget(ui, wdg);
+        }
+        if (ui->page_draw_cb) ui->page_draw_cb(ui, ui->page, ui->page_draw_ud);
     }
 
     win->current_color = oc;
     win->font_size = ofs;
+    win->alpha = oa;
 }
 
 int ag_ui_handle(ag_ui *ui, const ag_event *ev)
@@ -1965,6 +3582,12 @@ int ag_ui_handle(ag_ui *ui, const ag_event *ev)
         struct ag_widget *h = ag_ui_widget_at(ui, ev->x, ev->y);
         for (struct ag_widget *w = ui->head; w; w = w->next)
             w->hovered = (w == h);
+
+        if (ui->pressed && ui->pressed->kind == AG_WIDGET_VIDEO_T &&
+            ui->pressed->u.video.seek_drag && !ui->pressed->removed) {
+            ui_video_seek_at(ui->pressed, ev->x);
+            return 1;
+        }
 
         if (ui->pressed && ui->pressed->kind == AG_WIDGET_SLIDER_T &&
             !ui->pressed->removed) {
@@ -2028,6 +3651,21 @@ int ag_ui_handle(ag_ui *ui, const ag_event *ev)
                 h->u.textview.pinned = (h->u.textview.scroll >= ms);
             }
         }
+        if (h->kind == AG_WIDGET_VIDEO_T) {
+            int bar = h->h > UI_VIDEO_BAR * 2 ? UI_VIDEO_BAR : 0;
+            int by = h->y + h->h - bar;
+            int bx = h->x + 6;
+            if (bar > 0 && ev->y >= by) {
+                if (ev->x >= bx && ev->x < bx + 22) {
+                    ag_video_widget_play(h, !ag_video_widget_playing(h));
+                    if (h->cb) h->cb(h, h->ud);
+                } else {
+                    h->u.video.seek_drag = 1;
+                    ui_video_seek_at(h, ev->x);
+                }
+            }
+            return 1;
+        }
         return 1;
     }
 
@@ -2038,6 +3676,7 @@ int ag_ui_handle(ag_ui *ui, const ag_event *ev)
         if (p->removed) return 1;
         p->pressed = 0;
         if (p->kind == AG_WIDGET_TEXTVIEW_T) p->u.textview.sb_drag = 0;
+        if (p->kind == AG_WIDGET_VIDEO_T)  p->u.video.seek_drag = 0;
         if (ag_ui_widget_at(ui, ev->x, ev->y) == p) {
             switch (p->kind) {
             case AG_WIDGET_BUTTON_T:
@@ -2048,7 +3687,10 @@ int ag_ui_handle(ag_ui *ui, const ag_event *ev)
                 if (p->cb) p->cb(p, p->ud);
                 break;
             default:
-                if (p->cb && p->kind == AG_WIDGET_SLIDER_T) p->cb(p, p->ud);
+                if (p->cb && (p->kind == AG_WIDGET_SLIDER_T  ||
+                              p->kind == AG_WIDGET_IMAGE_T   ||
+                              p->kind == AG_WIDGET_VIDEO_T))
+                    p->cb(p, p->ud);
                 break;
             }
             return 1;
@@ -2169,46 +3811,101 @@ static void ag_draw_text_font(ag_window *w, int x, int y, ag_font *f, const char
     }
 }
 
+static void ag_utf8_to_wide(const char *s, wchar_t *out, int cap)
+{
+    int o = 0;
+    if (!s) { if (cap > 0) out[0] = 0; return; }
+    while (*s && o < cap - 1) {
+        ag_u32 cp = utf8_decode(&s);
+        if (cp < 0x10000) out[o++] = (wchar_t)cp;
+    }
+    out[o] = 0;
+}
+
+static int ag_win32_make_font(ag_font *f, const wchar_t *family, int px)
+{
+    HFONT hf = CreateFontW(-(int)px, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                           DEFAULT_PITCH | FF_DONTCARE, family);
+    if (!hf) return 0;
+    if (!f->dc) {
+        f->dc = CreateCompatibleDC(NULL);
+        if (!f->dc) { DeleteObject(hf); return 0; }
+    }
+    SelectObject(f->dc, hf);
+    if (f->hfont) DeleteObject(f->hfont);
+    f->hfont = hf;
+    TEXTMETRICW tm;
+    GetTextMetricsW(f->dc, &tm);
+    f->ascent  = tm.tmAscent;
+    f->descent = tm.tmDescent;
+    return 1;
+}
+
 ag_font *ag_font_open(const char *name, unsigned int px)
 {
     if (!name || !px) return NULL;
+    if (ag_is_font_file(name)) return ag_font_open_file(name, px);
+
     ag_font *f = (ag_font *)ag_mem_alloc(sizeof(ag_font));
     if (!f) return NULL;
     f->px = px;
 
     wchar_t wname[256] = L"";
-    {
-        const char *s = name;
-        int wi = 0;
-        while (*s && wi < 255) {
-            ag_u32 cp = utf8_decode(&s);
-            if (cp < 0x10000) wname[wi++] = (wchar_t)cp;
-        }
-        wname[wi] = 0;
-    }
+    ag_utf8_to_wide(name, wname, 256);
 
-    f->hfont = CreateFontW(-(int)px, 0, 0, 0, FW_NORMAL, 0, 0, 0,
-                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                           DEFAULT_PITCH | FF_DONTCARE, wname);
-    if (!f->hfont) { ag_mem_free(f); return NULL; }
+    if (!ag_win32_make_font(f, wname, px)) { ag_mem_free(f); return NULL; }
+    snprintf(f->family, sizeof(f->family), "%s", name);
+    return f;
+}
 
-    f->dc = CreateCompatibleDC(NULL);
-    if (!f->dc) { DeleteObject(f->hfont); ag_mem_free(f); return NULL; }
-    SelectObject(f->dc, f->hfont);
+ag_font *ag_font_open_file(const char *path, unsigned int px)
+{
+    if (!path || !px) return NULL;
 
-    TEXTMETRICW tm;
-    GetTextMetricsW(f->dc, &tm);
-    f->ascent  = tm.tmAscent;
-    f->descent = tm.tmDescent;
+    char family[64];
+    if (!ag_ttf_family(path, family, sizeof(family))) return NULL;
+
+    wchar_t wpath[1024] = L"";
+    ag_utf8_to_wide(path, wpath, 1024);
+    AddFontResourceExW(wpath, FR_PRIVATE, NULL);
+
+    ag_font *f = (ag_font *)ag_mem_alloc(sizeof(ag_font));
+    if (!f) return NULL;
+    f->px = px;
+
+    wchar_t wfam[256] = L"";
+    ag_utf8_to_wide(family, wfam, 256);
+    if (!ag_win32_make_font(f, wfam, px)) { ag_mem_free(f); return NULL; }
+    snprintf(f->family, sizeof(f->family), "%s", family);
     return f;
 }
 
 ag_font *ag_font_default(unsigned int px)
 {
-    ag_font *f = ag_font_open("Segoe UI", px);
+    ag_font *f = ag_font_default_common(px);
+    if (f) return f;
+    f = ag_font_open("Segoe UI", px);
     if (!f) f = ag_font_open("Arial", px);
     return f;
+}
+
+const char *ag_font_family(const ag_font *f)
+{
+    return f ? f->family : "";
+}
+
+int ag_font_set_size(ag_font *f, unsigned int px)
+{
+    if (!f || !px) return 0;
+    if (f->px == px) return 1;
+    wchar_t wfam[256] = L"";
+    ag_utf8_to_wide(f->family, wfam, 256);
+    if (!ag_win32_make_font(f, wfam, (int)px)) return 0;
+    f->px = px;
+    ag_font_clear_cache(f);
+    return 1;
 }
 
 void ag_font_close(ag_font *f)
@@ -2413,6 +4110,7 @@ ag_window *ag_window_create(const char *title, int width, int height)
     w->width = width; w->height = height;
     w->current_color = AG_WHITE;
     w->font_size = 16;
+    w->alpha     = 255;
     w->clip_on = 0;
     strncpy(w->title, title ? title : "AGLib", sizeof(w->title) - 1);
     w->title[sizeof(w->title) - 1] = '\0';
@@ -2498,6 +4196,7 @@ int ag_poll_events(void)
         DispatchMessageA(&msg);
     }
     for (ag_window *w = g_windows; w; w = w->next) {
+        if (w->ui) ag_ui_update(w->ui);
         if (w->redraw_pending) {     
             w->redraw_pending = 0;
             ag_event ev; memset(&ev, 0, sizeof(ev));
@@ -2517,7 +4216,7 @@ void ag_main_loop(void)
     }
 }
 
-void ag_quit(void) { g_running = 0; PostQuitMessage(0); }
+void ag_quit(void) { g_running = 0; ag_quit_windows(); PostQuitMessage(0); }
 
 void ag_begin_frame(ag_window *w) { (void)w; }
 
@@ -2559,25 +4258,40 @@ ag_font *ag_font_open(const char *path, unsigned int px)
     f->ascent  = (int)((FT_MulFix(f->face->ascender, f->face->size->metrics.y_scale) + 32) / 64);
     int th      = (int)((FT_MulFix(f->face->height,  f->face->size->metrics.y_scale) + 32) / 64);
     f->descent = f->ascent - th;
+    ag_ttf_family(path, f->family, (int)sizeof(f->family));
+    if (!f->family[0]) {
+        const char *sl = strrchr(path, '/');
+        snprintf(f->family, sizeof(f->family), "%s", sl ? sl + 1 : path);
+    }
     return f;
+}
+
+ag_font *ag_font_open_file(const char *path, unsigned int px)
+{
+    return ag_font_open(path, px);
 }
 
 ag_font *ag_font_default(unsigned int px)
 {
-    static const char *paths[] = {
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-        NULL
-    };
-    for (int i = 0; paths[i]; ++i) {
-        ag_font *f = ag_font_open(paths[i], px);
-        if (f) return f;
-    }
-    return NULL;
+    return ag_font_default_common(px);
+}
+
+const char *ag_font_family(const ag_font *f)
+{
+    return f ? f->family : "";
+}
+
+int ag_font_set_size(ag_font *f, unsigned int px)
+{
+    if (!f || !px) return 0;
+    if (f->px == px) return 1;
+    if (FT_Set_Pixel_Sizes(f->face, 0, px)) return 0;
+    f->px = px;
+    f->ascent  = (int)((FT_MulFix(f->face->ascender, f->face->size->metrics.y_scale) + 32) / 64);
+    int th      = (int)((FT_MulFix(f->face->height,  f->face->size->metrics.y_scale) + 32) / 64);
+    f->descent = f->ascent - th;
+    ag_font_clear_cache(f);
+    return 1;
 }
 
 void ag_font_close(ag_font *f)
@@ -2697,14 +4411,37 @@ ag_window *ag_window_create(const char *title, int width, int height)
     w->width = width; w->height = height;
     w->current_color = AG_WHITE;
     w->font_size = 16;
+    w->alpha     = 255;
     w->clip_on = 0;
     strncpy(w->title, title ? title : "AGLib", sizeof(w->title) - 1);
     w->title[sizeof(w->title) - 1] = '\0';
 
-    w->win = XCreateSimpleWindow(w->dpy, RootWindow(w->dpy, w->screen),
-                                 0, 0, width, height, 0,
-                                 BlackPixel(w->dpy, w->screen),
-                                 BlackPixel(w->dpy, w->screen));
+    void *visual = NULL;
+    int depth = 0;
+    if (ag_gl_x11_visual(w->dpy, w->screen, &visual, &depth)) {
+        XVisualInfo *vi = (XVisualInfo *)visual;
+        Colormap cmap = XCreateColormap(w->dpy, RootWindow(w->dpy, w->screen),
+                                        vi->visual, AllocNone);
+        XSetWindowAttributes swa;
+        memset(&swa, 0, sizeof(swa));
+        swa.colormap = cmap;
+        swa.border_pixel = 0;
+        swa.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask |
+                         ButtonPressMask | ButtonReleaseMask |
+                         PointerMotionMask | StructureNotifyMask;
+        w->win = XCreateWindow(w->dpy, RootWindow(w->dpy, w->screen),
+                               0, 0, width, height, 0, vi->depth,
+                               InputOutput, vi->visual,
+                               CWColormap | CWBorderPixel | CWEventMask, &swa);
+        w->gl_visual = vi;
+        w->gl_cmap = cmap;
+    }
+    if (!w->win) {
+        w->win = XCreateSimpleWindow(w->dpy, RootWindow(w->dpy, w->screen),
+                                     0, 0, width, height, 0,
+                                     BlackPixel(w->dpy, w->screen),
+                                     BlackPixel(w->dpy, w->screen));
+    }
 
     XStoreName(w->dpy, w->win, w->title);
 
@@ -2940,6 +4677,7 @@ int ag_poll_events(void)
                 break;
             }
         }
+        if (w->ui) ag_ui_update(w->ui);
         if (w->redraw_pending) {
             w->redraw_pending = 0;
             ag_event ev; memset(&ev, 0, sizeof(ev));
@@ -2964,13 +4702,26 @@ void ag_main_loop(void)
     }
 }
 
-void ag_quit(void) { g_running = 0; }
+void ag_quit(void) { g_running = 0; ag_quit_windows(); }
 
 void ag_begin_frame(ag_window *w) { (void)w; }
 
 void ag_end_frame(ag_window *w)
 {
-    if (!w || !w->img) return;
+    if (!w) return;
+
+    if (w->gl_visual) {
+        if (!w->present)
+            w->present = ag_gl_present_x11(w->dpy, w->win, w->gl_visual);
+        if (w->present) {
+            ag_gl_present_frame(w->present, w->backbuf, w->width, w->height,
+                                w->layers, w->nlayers);
+            w->nlayers = 0;
+            return;
+        }
+    }
+
+    if (!w->img) return;
     XPutImage(w->dpy, w->win, w->gc, w->img, 0, 0, 0, 0, w->width, w->height);
     XFlush(w->dpy);
 }
@@ -3464,6 +5215,7 @@ ag_window *ag_window_create(const char *title, int width, int height)
     w->width = width; w->height = height;
     w->current_color = AG_WHITE;
     w->font_size = 16;
+    w->alpha     = 255;
     w->clip_on = 0;
     strncpy(w->title, title ? title : "AGLib", sizeof(w->title) - 1);
     w->title[sizeof(w->title) - 1] = '\0';
@@ -3601,6 +5353,7 @@ int ag_poll_events(void)
 
     for (ag_window *w = g_windows; w; w = w->next) {
         if (w->should_close || !w->configured) continue;
+        if (w->ui) ag_ui_update(w->ui);
         if (w->redraw_pending) {
             w->redraw_pending = 0;
             ag_event ev; memset(&ev, 0, sizeof(ev));
@@ -3623,7 +5376,7 @@ void ag_main_loop(void)
     }
 }
 
-void ag_quit(void) { g_running = 0; }
+void ag_quit(void) { g_running = 0; ag_quit_windows(); }
 
 void ag_begin_frame(ag_window *w) { (void)w; }
 
