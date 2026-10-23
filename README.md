@@ -2,7 +2,7 @@
 > AGLib
 
 **it's a Lightweight**
-> 10K SLOC! + 10 MiB! and just a few libs
+> 9K SLOC! + 10 MiB! and just a few libs
 
 **It's Cross-platform**
 > Can work on **UNIX And NT!**
@@ -15,7 +15,7 @@
 # Building
 
 ```sh
-make            # builds app-wayland + app.exe (Wayland is the preferred backend)
+make            # builds `app` (X11) and `app.exe` (Windows)
 make app        # builds `app` (X11)
 make app.exe    # builds the Windows exe (mingw)
 make wayland    # builds `app-wayland`
@@ -469,14 +469,13 @@ Open a video. `AG_VIDEO_BACKEND_AUTO` detects the container by its
 signature (AVI, raw MJPEG stream, MP4, MKV) and picks the built in
 decoder. Everything happens in process — no external players or tools.
 
-Containers: MP4/MOV (ISO-BMFF), MKV/WebM (EBML), AVI and a raw MJPEG
-stream. Codecs: H.264 video (any profile, B frames included), MJPEG
-video, AAC and MP3 audio. The decoders are linked into the binary, so a
-plain `movie.mp4` or `movie.mkv` (H.264 + AAC) plays without anything
-installed — the same on Linux and on Windows. A file whose video codec is
-not H.264/MJPEG (HEVC, VP9, AV1, ...) fails to open with an error naming
-the codec; an unsupported audio codec (Vorbis, Opus, ...) plays the video
-without sound.
+* Containers: MP4/MOV, MKV/WebM, AVI, raw MJPEG
+* Video codecs: H.264 (any profile, B frames), MJPEG
+* Audio codecs: AAC, MP3 — the sound plays with the video
+* All decoders are linked into the binary: nothing to install, the same
+  on Linux and Windows
+* HEVC/VP9/AV1 video → open fails with the codec name in the error;
+  Vorbis/Opus audio → the file plays without sound
 
 `void ag_video_close(v)`
 
@@ -579,10 +578,12 @@ Set scroll (-1 = pin to bottom)
 
 # Licenses
 
-AGLib keeps every dependency as a git submodule (`git submodule update
---init` fetches them) and links it statically: the built binaries need no
-system packages and load nothing at runtime. Third party notices, license
-texts and where to get the sources are collected in [NOTICE](NOTICE) —
-notably OpenH264 (BSD-2-Clause) and the Fraunhofer FDK AAC codec (whose
-license text is retained in the submodule and has to travel with binary
-redistributions).
+Every dependency is a git submodule under `third_party/` and links
+statically — no system packages, no runtime loading. Each keeps its own
+license text next to the sources:
+
+* OpenH264 — BSD-2-Clause, `third_party/openh264/LICENSE`
+* FDK AAC — Fraunhofer FDK AAC license, `third_party/fdk-aac/NOTICE`;
+  that text has to travel with binary redistributions, as it requires
+* minimp3 — CC0; zlib / libpng / libjpeg / nanosvg — permissive, see
+  `third_party/<name>/LICENSE*`

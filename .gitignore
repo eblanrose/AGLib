@@ -15,3 +15,4 @@ third_party/wayland/*-protocol.c
 !test.png
 !test.jpg
 assets/test.mp4
+obj

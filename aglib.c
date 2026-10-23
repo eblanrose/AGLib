@@ -26,6 +26,7 @@
 #  include FT_FREETYPE_H
 #  ifdef AG_USE_WAYLAND
 #    include <wayland-client.h>
+#    include <wayland-cursor.h>
 #    include <xkbcommon/xkbcommon.h>
 #    include <sys/mman.h>
 #    include <sys/stat.h>
@@ -36,10 +37,8 @@
 #    include "xdg-shell-client-protocol.h"
 #    include "xdg-decoration-unstable-v1-client-protocol.h"
 #  else
-#    include <X11/Xlib.h>
-#    include <X11/Xutil.h>
-#    include <X11/keysym.h>
-#    include <X11/Xlocale.h>
+#    include <xcb/xcb.h>
+#    include <xkbcommon/xkbcommon.h>
 #  endif
 #endif
 
@@ -65,9 +64,6 @@ struct ag_window {
 
     ag_u32  *rt;
     int      rt_w, rt_h;
-
-    ag_gl_layer layers[2];
-    int         nlayers;
 
     ag_u32 *backbuf;
 
@@ -99,17 +95,8 @@ struct ag_window {
     int                  configured;
     int                  pending_w, pending_h;
 #else
-    Display  *dpy;
-    Window    win;
-    GC        gc;
-    XImage   *img;
-    Atom      wm_delete;
-    int       screen;
-    XIM       xim;                
-    XIC       xic;
-    void     *gl_visual;
-    Colormap  gl_cmap;
-    ag_gl_present *present;
+    xcb_window_t   win;
+    xcb_gcontext_t gc;
 #endif
 
     struct ag_window *next;
@@ -2215,7 +2202,6 @@ void ag_ui_set_page(ag_ui *ui, int page)
     ui->anim_active = 1;
     ui->out_valid = 0;
     ui->in_valid = 0;
-    if (ui->win) ui->win->nlayers = 0;
     ag_window_redraw(ui->win);
 }
 
@@ -3417,16 +3403,6 @@ static void ui_page_composite(ag_window *w, const ag_u32 *buf, int bw, int bh,
     }
 }
 
-static int ag_window_gpu_layers(ag_window *w)
-{
-#if defined(_WIN32) || defined(AG_USE_WAYLAND)
-    (void)w;
-    return 0;
-#else
-    return w && w->present != NULL;
-#endif
-}
-
 static void ui_layer_params(ag_ui *ui, int incoming, float p,
                             float *alpha, float *sx, float *sy,
                             int *ox, int *oy)
@@ -3505,25 +3481,7 @@ void ag_ui_draw(ag_ui *ui)
             win->rt = NULL;
             ui->out_valid = 1;
         }
-        int gpu = ag_window_gpu_layers(win);
-        ag_gl_layer layers[2];
-        float a0, sx0, sy0, a1, sx1, sy1;
-        int ox0, oy0, ox1, oy1;
-        ui_layer_params(ui, 0, p, &a0, &sx0, &sy0, &ox0, &oy0);
-        ui_layer_params(ui, 1, p, &a1, &sx1, &sy1, &ox1, &oy1);
-
-        if (gpu) {
-            layers[0].pixels = ui->page_buf_out;
-            layers[0].w = ui->page_buf_w;
-            layers[0].h = ui->page_buf_h;
-            layers[0].alpha = a0;
-            layers[0].scale = sx0;
-            layers[0].ox = ox0;
-            layers[0].oy = oy0;
-            layers[0].dirty = !ui->out_valid;
-        } else {
-            ui_composite_buf(ui, ui->page_buf_out, 0, p);
-        }
+        ui_composite_buf(ui, ui->page_buf_out, 0, p);
 
         int stagger = 0;
         for (struct ag_widget *wg = ui->head; wg; wg = wg->next)
@@ -3540,21 +3498,7 @@ void ag_ui_draw(ag_ui *ui)
             ui->in_valid = !stagger;
         }
 
-        if (gpu) {
-            layers[1].pixels = ui->page_buf;
-            layers[1].w = ui->page_buf_w;
-            layers[1].h = ui->page_buf_h;
-            layers[1].alpha = a1;
-            layers[1].scale = sx1;
-            layers[1].ox = ox1;
-            layers[1].oy = oy1;
-            layers[1].dirty = 1;
-            win->layers[0] = layers[0];
-            win->layers[1] = layers[1];
-            win->nlayers = 2;
-        } else {
-            ui_composite_buf(ui, ui->page_buf, 1, p);
-        }
+        ui_composite_buf(ui, ui->page_buf, 1, p);
 
         for (struct ag_widget *wdg = ui->head; wdg; wdg = wdg->next) {
             if (wdg->removed || wdg->page != AG_PAGE_GLOBAL) continue;
@@ -4368,46 +4312,132 @@ static void ag_draw_text_font(ag_window *w, int x, int y, ag_font *f, const char
 
 #ifndef AG_USE_WAYLAND
 
+
+static xcb_connection_t *g_conn   = NULL;
+static xcb_screen_t     *g_screen = NULL;
+static xcb_atom_t        g_wm_delete = 0;
+static xcb_atom_t        g_wm_protocols = 0;
+
+static xcb_keysym_t *g_key_syms = NULL;
+static void         *g_key_map    = NULL;
+static int           g_keysyms_per = 0;
+static uint8_t       g_min_kc = 0, g_max_kc = 0;
+
 static int ag_backend_keyctl(int raw)
 {
     switch (raw) {
-    case XK_BackSpace:  return AGK_BACKSPACE;
-    case XK_Delete:     return AGK_DELETE;
-    case XK_Left:       return AGK_LEFT;
-    case XK_Right:      return AGK_RIGHT;
-    case XK_Home:       return AGK_HOME;
-    case XK_End:        return AGK_END;
-    case XK_Return:     return AGK_RETURN;
-    case XK_Tab:        return AGK_TAB;
-    case XK_Up:         return AGK_UP;
-    case XK_Down:       return AGK_DOWN;
-    case XK_Escape:     return AGK_ESC;
-    default:            return AGK_NONE;
+    case XKB_KEY_BackSpace:  return AGK_BACKSPACE;
+    case XKB_KEY_Delete:     return AGK_DELETE;
+    case XKB_KEY_Left:       return AGK_LEFT;
+    case XKB_KEY_Right:      return AGK_RIGHT;
+    case XKB_KEY_Home:       return AGK_HOME;
+    case XKB_KEY_End:        return AGK_END;
+    case XKB_KEY_Return:     return AGK_RETURN;
+    case XKB_KEY_Tab:        return AGK_TAB;
+    case XKB_KEY_Up:         return AGK_UP;
+    case XKB_KEY_Down:       return AGK_DOWN;
+    case XKB_KEY_Escape:     return AGK_ESC;
+    default:                 return AGK_NONE;
     }
+}
+
+static void refresh_keymap(void)
+{
+    const xcb_setup_t *setup = xcb_get_setup(g_conn);
+    g_min_kc = setup->min_keycode;
+    g_max_kc = setup->max_keycode;
+    xcb_get_keyboard_mapping_cookie_t ck = xcb_get_keyboard_mapping(
+        g_conn, g_min_kc, (uint16_t)(g_max_kc - g_min_kc + 1));
+    xcb_get_keyboard_mapping_reply_t *r =
+        xcb_get_keyboard_mapping_reply(g_conn, ck, NULL);
+    if (!r) return;
+    free(g_key_map);
+    g_key_map     = r;
+    g_key_syms    = (xcb_keysym_t *)(r + 1);
+    g_keysyms_per = r->keysyms_per_keycode;
+}
+
+static xkb_keysym_t translate_key(uint8_t keycode, uint16_t state)
+{
+    if (!g_key_syms || keycode < g_min_kc || keycode > g_max_kc)
+        return XKB_KEY_NoSymbol;
+
+    const xcb_keysym_t *s =
+        g_key_syms + (size_t)(keycode - g_min_kc) * g_keysyms_per;
+
+    int shift = (state & XCB_MOD_MASK_SHIFT) != 0;
+    int lock  = (state & XCB_MOD_MASK_LOCK)  != 0;
+    int alt   = (state & XCB_MOD_MASK_5)     != 0;
+    int group = (state >> 13) & 3;
+
+    if (lock && !shift && g_keysyms_per > 1 &&
+        s[0] != XKB_KEY_NoSymbol && s[1] != XKB_KEY_NoSymbol) {
+        uint32_t ca = xkb_keysym_to_utf32(s[0]);
+        uint32_t cb = xkb_keysym_to_utf32(s[1]);
+        if (ca && cb && (ca & 0x20) && cb == (ca & ~0x20u)) shift = 1;
+    }
+
+    int col = group * 2 + (alt ? 2 : 0) + (shift ? 1 : 0);
+    if (col >= g_keysyms_per) col = shift;
+    xcb_keysym_t ks = s[col];
+    if (ks == XKB_KEY_NoSymbol && col != 0) {
+        int base = group * 2;
+        ks = (base < g_keysyms_per) ? s[base] : s[0];
+    }
+    return ks;
+}
+
+static int x11_connect(void)
+{
+    if (g_conn) return 1;
+
+    int scr = 0;
+    g_conn = xcb_connect(NULL, &scr);
+    if (!g_conn || xcb_connection_has_error(g_conn)) {
+        if (g_conn) { xcb_disconnect(g_conn); g_conn = NULL; }
+        return 0;
+    }
+    g_screen = xcb_setup_roots_iterator(xcb_get_setup(g_conn)).data;
+
+    xcb_intern_atom_cookie_t ac = xcb_intern_atom(
+        g_conn, 0, (uint16_t)strlen("WM_DELETE_WINDOW"), "WM_DELETE_WINDOW");
+    xcb_intern_atom_reply_t *ar = xcb_intern_atom_reply(g_conn, ac, NULL);
+    if (ar) { g_wm_delete = ar->atom; free(ar); }
+
+    ac = xcb_intern_atom(
+        g_conn, 0, (uint16_t)strlen("WM_PROTOCOLS"), "WM_PROTOCOLS");
+    ar = xcb_intern_atom_reply(g_conn, ac, NULL);
+    if (ar) { g_wm_protocols = ar->atom; free(ar); }
+
+    refresh_keymap();
+    return 1;
 }
 
 int ag_init(void)
 {
     setlocale(LC_ALL, "");
-    if (XSupportsLocale()) {
-        XSetLocaleModifiers("");
-    }
     return 0;
 }
 
-void ag_shutdown(void) { }
+void ag_shutdown(void)
+{
+    free(g_key_map); g_key_map = NULL;
+    g_key_syms = NULL; g_keysyms_per = 0;
+    if (g_conn) { xcb_disconnect(g_conn); g_conn = NULL; }
+    g_screen = NULL;
+    g_wm_delete = 0;
+    g_wm_protocols = 0;
+}
 
 const char *ag_get_platform(void) { return "x11"; }
 
 ag_window *ag_window_create(const char *title, int width, int height)
 {
+    if (!x11_connect()) return NULL;
+
     ag_window *w = (ag_window *)ag_mem_alloc(sizeof(ag_window));
     if (!w) return NULL;
 
-    w->dpy = XOpenDisplay(NULL);
-    if (!w->dpy) { ag_mem_free(w); return NULL; }
-
-    w->screen = DefaultScreen(w->dpy);
     w->width = width; w->height = height;
     w->current_color = AG_WHITE;
     w->font_size = 16;
@@ -4416,66 +4446,38 @@ ag_window *ag_window_create(const char *title, int width, int height)
     strncpy(w->title, title ? title : "AGLib", sizeof(w->title) - 1);
     w->title[sizeof(w->title) - 1] = '\0';
 
-    void *visual = NULL;
-    int depth = 0;
-    if (ag_gl_x11_visual(w->dpy, w->screen, &visual, &depth)) {
-        XVisualInfo *vi = (XVisualInfo *)visual;
-        Colormap cmap = XCreateColormap(w->dpy, RootWindow(w->dpy, w->screen),
-                                        vi->visual, AllocNone);
-        XSetWindowAttributes swa;
-        memset(&swa, 0, sizeof(swa));
-        swa.colormap = cmap;
-        swa.border_pixel = 0;
-        swa.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask |
-                         ButtonPressMask | ButtonReleaseMask |
-                         PointerMotionMask | StructureNotifyMask;
-        w->win = XCreateWindow(w->dpy, RootWindow(w->dpy, w->screen),
-                               0, 0, width, height, 0, vi->depth,
-                               InputOutput, vi->visual,
-                               CWColormap | CWBorderPixel | CWEventMask, &swa);
-        w->gl_visual = vi;
-        w->gl_cmap = cmap;
+    uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
+    uint32_t values[2];
+    values[0] = 0;
+    values[1] = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_KEY_PRESS |
+                XCB_EVENT_MASK_KEY_RELEASE | XCB_EVENT_MASK_BUTTON_PRESS |
+                XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION |
+                XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+
+    w->win = xcb_generate_id(g_conn);
+    xcb_create_window(g_conn, XCB_COPY_FROM_PARENT ,
+                      w->win, g_screen->root,
+                      0, 0, (uint16_t)width, (uint16_t)height, 0,
+                      XCB_WINDOW_CLASS_INPUT_OUTPUT,
+                      g_screen->root_visual, mask, values);
+
+    xcb_change_property(g_conn, XCB_PROP_MODE_REPLACE, w->win,
+                        XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8,
+                        (uint32_t)strlen(w->title), w->title);
+
+    if (g_wm_delete)
+        xcb_change_property(g_conn, XCB_PROP_MODE_REPLACE, w->win,
+                            g_wm_protocols, XCB_ATOM_ATOM, 32, 1,
+                            &g_wm_delete);
+
+    w->gc = xcb_generate_id(g_conn);
+    {
+        uint32_t gcmask = XCB_GC_GRAPHICS_EXPOSURES;
+        uint32_t gcval  = 0;
+        xcb_create_gc(g_conn, w->gc, w->win, gcmask, &gcval);
     }
-    if (!w->win) {
-        w->win = XCreateSimpleWindow(w->dpy, RootWindow(w->dpy, w->screen),
-                                     0, 0, width, height, 0,
-                                     BlackPixel(w->dpy, w->screen),
-                                     BlackPixel(w->dpy, w->screen));
-    }
-
-    XStoreName(w->dpy, w->win, w->title);
-
-    XSelectInput(w->dpy, w->win,
-                 ExposureMask | KeyPressMask | KeyReleaseMask |
-                 ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-                 StructureNotifyMask);
-
-    w->wm_delete = XInternAtom(w->dpy, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(w->dpy, w->win, &w->wm_delete, 1);
-
-    w->gc = XCreateGC(w->dpy, w->win, 0, NULL);
 
     backbuf_resize(w, width, height);
-    w->img = XCreateImage(w->dpy, DefaultVisual(w->dpy, w->screen),
-                          DefaultDepth(w->dpy, w->screen),
-                          ZPixmap, 0, (char *)w->backbuf,
-                          width, height, 32, 0);
-    if (!w->img) { XCloseDisplay(w->dpy); ag_mem_free(w); return NULL; }
-    w->img->byte_order       = LSBFirst;
-    w->img->bitmap_bit_order = LSBFirst;
-
-    w->xim = NULL;
-    w->xic = NULL;
-    if (XSupportsLocale()) {
-        w->xim = XOpenIM(w->dpy, NULL, NULL, NULL);
-        if (w->xim) {
-            w->xic = XCreateIC(w->xim,
-                               XNInputStyle,
-                               XIMPreeditNothing | XIMStatusNothing,
-                               XNClientWindow, w->win,
-                               NULL);
-        }
-    }
 
     w->next = g_windows;
     g_windows = w;
@@ -4490,15 +4492,10 @@ void ag_window_destroy(ag_window *w)
     while (*pp && *pp != w) pp = &(*pp)->next;
     if (*pp) *pp = w->next;
 
-    if (w->img) {
-        w->img->data = NULL;
-        XDestroyImage(w->img);
+    if (g_conn) {
+        if (w->gc)  xcb_free_gc(g_conn, w->gc);
+        if (w->win) xcb_destroy_window(g_conn, w->win);
     }
-    if (w->xic) XDestroyIC(w->xic);
-    if (w->xim) XCloseIM(w->xim);
-    if (w->gc)  XFreeGC(w->dpy, w->gc);
-    if (w->win) XDestroyWindow(w->dpy, w->win);
-    if (w->dpy) XCloseDisplay(w->dpy);
     free(w->backbuf);
     ag_mem_free(w);
 }
@@ -4508,13 +4505,17 @@ void ag_window_set_title(ag_window *w, const char *title)
     if (!w || !title) return;
     strncpy(w->title, title, sizeof(w->title) - 1);
     w->title[sizeof(w->title) - 1] = '\0';
-    XStoreName(w->dpy, w->win, title);
+    xcb_change_property(g_conn, XCB_PROP_MODE_REPLACE, w->win,
+                        XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8,
+                        (uint32_t)strlen(w->title), w->title);
 }
 
 void ag_window_set_size(ag_window *w, int width, int height)
 {
     if (!w) return;
-    XResizeWindow(w->dpy, w->win, width, height);
+    uint32_t v[2] = { (uint32_t)width, (uint32_t)height };
+    xcb_configure_window(g_conn, w->win,
+                         XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, v);
 }
 
 void ag_window_get_size(ag_window *w, int *width, int *height)
@@ -4530,153 +4531,146 @@ void ag_window_set_callback(ag_window *w, ag_event_cb cb, void *userdata)
     w->cb = cb; w->userdata = userdata;
 }
 
-void ag_window_show(ag_window *w) { if (w) XMapWindow(w->dpy, w->win); }
-void ag_window_hide(ag_window *w) { if (w) XUnmapWindow(w->dpy, w->win); }
+void ag_window_show(ag_window *w) { if (w) xcb_map_window(g_conn, w->win); }
+void ag_window_hide(ag_window *w) { if (w) xcb_unmap_window(g_conn, w->win); }
 
-static ag_window *find_window_by_xid(Window xid)
+static ag_window *find_window_by_xid(xcb_window_t xid)
 {
     for (ag_window *w = g_windows; w; w = w->next)
         if (w->win == xid) return w;
     return NULL;
 }
 
-static void ag_recreate_image(ag_window *w)
-{
-    if (w->img) {
-        w->img->data = NULL;
-        XDestroyImage(w->img);
-    }
-    w->img = XCreateImage(w->dpy, DefaultVisual(w->dpy, w->screen),
-                          DefaultDepth(w->dpy, w->screen),
-                          ZPixmap, 0, (char *)w->backbuf,
-                          w->width, w->height, 32, 0);
-    if (w->img) {
-        w->img->byte_order       = LSBFirst;
-        w->img->bitmap_bit_order = LSBFirst;
-    }
-}
-
 int ag_poll_events(void)
 {
-    for (ag_window *w = g_windows; w; ) {
-        ag_window *next = w->next;
-        Display *dpy = w->dpy;
+    if (!g_conn) return 0;
+    xcb_flush(g_conn);
 
-        while (XPending(dpy)) {
-            XEvent xe;
-            XNextEvent(dpy, &xe);
+    xcb_generic_event_t *xe;
+    while ((xe = xcb_poll_for_event(g_conn)) != NULL) {
+        uint8_t type = xe->response_type & ~0x80u;
 
-            ag_window *tw = find_window_by_xid(xe.xany.window);
-            if (!tw) continue;
-
-            ag_event ev; memset(&ev, 0, sizeof(ev));
-
-            switch (xe.type) {
-            case Expose:
-                ev.type = AG_EVENT_EXPOSE;
-                if (tw->cb) tw->cb(tw, &ev, tw->userdata);
-                break;
-
-            case ConfigureNotify:
-                if (xe.xconfigure.width != tw->width ||
-                    xe.xconfigure.height != tw->height) {
-                    ev.type  = AG_EVENT_RESIZE;
-                    ev.width = xe.xconfigure.width;
-                    ev.height = xe.xconfigure.height;
-                    backbuf_resize(tw, ev.width, ev.height);
-                    ag_recreate_image(tw);
-                    if (tw->cb) tw->cb(tw, &ev, tw->userdata);
-                }
-                break;
-
-            case ClientMessage:
-                if ((Atom)xe.xclient.data.l[0] == tw->wm_delete) {
-                    ev.type = AG_EVENT_CLOSE;
-                    if (!tw->cb || tw->cb(tw, &ev, tw->userdata) != 1)
-                        tw->should_close = 1;
-                }
-                break;
-
-            case ButtonPress:
-                if (xe.xbutton.button == 4 || xe.xbutton.button == 5) {
-                    ev.type = AG_EVENT_MOUSE_WHEEL;
-                    ev.x = ev.mouse_x = xe.xbutton.x;
-                    ev.y = ev.mouse_y = xe.xbutton.y;
-                    ev.wheel_delta = (xe.xbutton.button == 4) ? 1 : -1;
-                    if (tw->cb) tw->cb(tw, &ev, tw->userdata);
-                    break;
-                }
-                ev.type   = AG_EVENT_MOUSE_DOWN;
-                ev.x = ev.mouse_x = xe.xbutton.x;
-                ev.y = ev.mouse_y = xe.xbutton.y;
-                ev.button = xe.xbutton.button;
-                if (tw->cb) tw->cb(tw, &ev, tw->userdata);
-                break;
-
-            case ButtonRelease:
-                if (xe.xbutton.button == 4 || xe.xbutton.button == 5) break;
-                ev.type   = AG_EVENT_MOUSE_UP;
-                ev.x = ev.mouse_x = xe.xbutton.x;
-                ev.y = ev.mouse_y = xe.xbutton.y;
-                ev.button = xe.xbutton.button;
-                if (tw->cb) tw->cb(tw, &ev, tw->userdata);
-                break;
-
-            case MotionNotify:
-                ev.type   = AG_EVENT_MOUSE_MOVE;
-                ev.x = ev.mouse_x = xe.xmotion.x;
-                ev.y = ev.mouse_y = xe.xmotion.y;
-                if (tw->cb) tw->cb(tw, &ev, tw->userdata);
-                break;
-
-            case KeyPress: {
-                KeySym ks = XLookupKeysym(&xe.xkey, 0);
-                ev.type = AG_EVENT_KEY_DOWN;
-                ev.key  = (int)ks;
-                if (tw->cb) tw->cb(tw, &ev, tw->userdata);
-
-                ag_u32 cp = 0;
-                {
-                    char raw[64];
-                    KeySym ksy = NoSymbol;
-                    int n = 0;
-                    if (w->xic)
-                        n = Xutf8LookupString(w->xic, &xe.xkey, raw,
-                                              (int)sizeof(raw) - 1, &ksy, NULL);
-                    if (n <= 0) {
-                        KeySym ksy2 = NoSymbol;
-                        n = XLookupString(&xe.xkey, raw, (int)sizeof(raw) - 1,
-                                          &ksy2, NULL);
-                    }
-                    if (n > 0) {
-                        raw[n] = '\0';
-                        const char *p = raw;
-                        cp = utf8_decode(&p);
-                        if (cp == 0xFFFD || cp < 0x20)
-                            cp = (ag_u32)(unsigned char)raw[0];
-                    }
-                }
-                if (cp) {
-                    ag_event cev; memset(&cev, 0, sizeof(cev));
-                    cev.type = AG_EVENT_CHAR;
-                    cev.key  = (int)cp;
-                    if (tw->cb) tw->cb(tw, &cev, tw->userdata);
-                }
-                break;
-            }
-
-            case KeyRelease: {
-                KeySym ks = XLookupKeysym(&xe.xkey, 0);
-                ev.type = AG_EVENT_KEY_UP;
-                ev.key  = (int)ks;
-                if (tw->cb) tw->cb(tw, &ev, tw->userdata);
-                break;
-            }
-
-            default:
-                break;
-            }
+        if (type == XCB_MAPPING_NOTIFY) {
+            refresh_keymap();
+            free(xe);
+            continue;
         }
+
+        xcb_window_t xid = 0;
+        switch (type) {
+        case XCB_EXPOSE:            xid = ((xcb_expose_event_t *)xe)->window; break;
+        case XCB_CONFIGURE_NOTIFY:  xid = ((xcb_configure_notify_event_t *)xe)->window; break;
+        case XCB_CLIENT_MESSAGE:    xid = ((xcb_client_message_event_t *)xe)->window; break;
+        case XCB_BUTTON_PRESS:      xid = ((xcb_button_press_event_t *)xe)->event; break;
+        case XCB_BUTTON_RELEASE:    xid = ((xcb_button_release_event_t *)xe)->event; break;
+        case XCB_MOTION_NOTIFY:     xid = ((xcb_motion_notify_event_t *)xe)->event; break;
+        case XCB_KEY_PRESS:         xid = ((xcb_key_press_event_t *)xe)->event; break;
+        case XCB_KEY_RELEASE:       xid = ((xcb_key_release_event_t *)xe)->event; break;
+        default: break;
+        }
+
+        ag_window *tw = xid ? find_window_by_xid(xid) : NULL;
+        if (!tw) { free(xe); continue; }
+
+        ag_event ev; memset(&ev, 0, sizeof(ev));
+
+        switch (type) {
+        case XCB_EXPOSE:
+            ev.type = AG_EVENT_EXPOSE;
+            if (tw->cb) tw->cb(tw, &ev, tw->userdata);
+            break;
+
+        case XCB_CONFIGURE_NOTIFY: {
+            xcb_configure_notify_event_t *ce = (xcb_configure_notify_event_t *)xe;
+            if (ce->width != tw->width || ce->height != tw->height) {
+                ev.type  = AG_EVENT_RESIZE;
+                ev.width = ce->width;
+                ev.height = ce->height;
+                backbuf_resize(tw, ev.width, ev.height);
+                if (tw->cb) tw->cb(tw, &ev, tw->userdata);
+            }
+            break;
+        }
+
+        case XCB_CLIENT_MESSAGE:
+            if (((xcb_client_message_event_t *)xe)->data.data32[0] == g_wm_delete) {
+                ev.type = AG_EVENT_CLOSE;
+                if (!tw->cb || tw->cb(tw, &ev, tw->userdata) != 1)
+                    tw->should_close = 1;
+            }
+            break;
+
+        case XCB_BUTTON_PRESS: {
+            xcb_button_press_event_t *b = (xcb_button_press_event_t *)xe;
+            if (b->detail == 4 || b->detail == 5) {
+                ev.type = AG_EVENT_MOUSE_WHEEL;
+                ev.x = ev.mouse_x = b->event_x;
+                ev.y = ev.mouse_y = b->event_y;
+                ev.wheel_delta = (b->detail == 4) ? 1 : -1;
+                if (tw->cb) tw->cb(tw, &ev, tw->userdata);
+                break;
+            }
+            ev.type = AG_EVENT_MOUSE_DOWN;
+            ev.x = ev.mouse_x = b->event_x;
+            ev.y = ev.mouse_y = b->event_y;
+            ev.button = b->detail;
+            if (tw->cb) tw->cb(tw, &ev, tw->userdata);
+            break;
+        }
+
+        case XCB_BUTTON_RELEASE: {
+            xcb_button_release_event_t *b = (xcb_button_release_event_t *)xe;
+            if (b->detail == 4 || b->detail == 5) break;
+            ev.type = AG_EVENT_MOUSE_UP;
+            ev.x = ev.mouse_x = b->event_x;
+            ev.y = ev.mouse_y = b->event_y;
+            ev.button = b->detail;
+            if (tw->cb) tw->cb(tw, &ev, tw->userdata);
+            break;
+        }
+
+        case XCB_MOTION_NOTIFY: {
+            xcb_motion_notify_event_t *m = (xcb_motion_notify_event_t *)xe;
+            ev.type = AG_EVENT_MOUSE_MOVE;
+            ev.x = ev.mouse_x = m->event_x;
+            ev.y = ev.mouse_y = m->event_y;
+            if (tw->cb) tw->cb(tw, &ev, tw->userdata);
+            break;
+        }
+
+        case XCB_KEY_PRESS: {
+            xcb_key_press_event_t *k = (xcb_key_press_event_t *)xe;
+            xkb_keysym_t ks = translate_key(k->detail, k->state);
+
+            ev.type = AG_EVENT_KEY_DOWN;
+            ev.key  = (int)ks;
+            if (tw->cb) tw->cb(tw, &ev, tw->userdata);
+
+            ag_u32 cp = (ag_u32)xkb_keysym_to_utf32(ks);
+            if (cp) {
+                ag_event cev; memset(&cev, 0, sizeof(cev));
+                cev.type = AG_EVENT_CHAR;
+                cev.key  = (int)cp;
+                if (tw->cb) tw->cb(tw, &cev, tw->userdata);
+            }
+            break;
+        }
+
+        case XCB_KEY_RELEASE: {
+            xcb_key_release_event_t *k = (xcb_key_release_event_t *)xe;
+            ev.type = AG_EVENT_KEY_UP;
+            ev.key  = (int)translate_key(k->detail, k->state);
+            if (tw->cb) tw->cb(tw, &ev, tw->userdata);
+            break;
+        }
+
+        default:
+            break;
+        }
+        free(xe);
+    }
+
+    for (ag_window *w = g_windows; w; w = w->next) {
         if (w->ui) ag_ui_update(w->ui);
         if (w->redraw_pending) {
             w->redraw_pending = 0;
@@ -4684,7 +4678,6 @@ int ag_poll_events(void)
             ev.type = AG_EVENT_EXPOSE;
             if (w->cb) w->cb(w, &ev, w->userdata);
         }
-        w = next;
     }
 
     for (ag_window *w = g_windows; w; w = w->next)
@@ -4708,22 +4701,23 @@ void ag_begin_frame(ag_window *w) { (void)w; }
 
 void ag_end_frame(ag_window *w)
 {
-    if (!w) return;
+    if (!w || !g_conn || !w->backbuf) return;
+    if (w->width <= 0 || w->height <= 0) return;
 
-    if (w->gl_visual) {
-        if (!w->present)
-            w->present = ag_gl_present_x11(w->dpy, w->win, w->gl_visual);
-        if (w->present) {
-            ag_gl_present_frame(w->present, w->backbuf, w->width, w->height,
-                                w->layers, w->nlayers);
-            w->nlayers = 0;
-            return;
-        }
+    uint32_t stride  = (uint32_t)w->width * 4;
+    uint32_t max_req = xcb_get_maximum_request_length(g_conn);
+    uint32_t rows    = (max_req > 16) ? (max_req * 4 - 64) / stride : 1;
+    if (rows < 1) rows = 1;
+
+    for (int y = 0; y < w->height; y += (int)rows) {
+        int h = (int)rows;
+        if (y + h > w->height) h = w->height - y;
+        xcb_put_image(g_conn, XCB_IMAGE_FORMAT_Z_PIXMAP, w->win, w->gc,
+                      (uint16_t)w->width, (uint16_t)h, 0, (int16_t)y, 0,
+                      g_screen->root_depth, stride * (uint32_t)h,
+                      (const uint8_t *)w->backbuf + (size_t)y * stride);
     }
-
-    if (!w->img) return;
-    XPutImage(w->dpy, w->win, w->gc, w->img, 0, 0, 0, 0, w->width, w->height);
-    XFlush(w->dpy);
+    xcb_flush(g_conn);
 }
 
 #endif /* !AG_USE_WAYLAND */
@@ -4736,6 +4730,8 @@ static struct wl_display  *g_wl_display   = NULL;
 static struct wl_registry *g_wl_registry  = NULL;
 static struct wl_compositor *g_wl_compositor = NULL;
 static struct wl_shm      *g_wl_shm       = NULL;
+static struct wl_cursor_theme *g_wl_cursor_theme = NULL;
+static struct wl_surface  *g_wl_cursor_surface  = NULL;
 static struct xdg_wm_base *g_wl_wm_base   = NULL;
 static struct zxdg_decoration_manager_v1 *g_wl_decoration = NULL;
 static struct wl_seat     *g_wl_seat      = NULL;
@@ -4898,10 +4894,44 @@ static const struct zxdg_toplevel_decoration_v1_listener decoration_listener = {
     .configure = decoration_configure,
 };
 
+static void wl_set_cursor(struct wl_pointer *pointer, uint32_t serial)
+{
+    if (!g_wl_shm || !g_wl_compositor) return;
+
+    if (!g_wl_cursor_theme) {
+        int size = 24;
+        const char *env = getenv("XCURSOR_SIZE");
+        if (env) {
+            int v = atoi(env);
+            if (v >= 8 && v <= 512) size = v;
+        }
+        g_wl_cursor_theme = wl_cursor_theme_load(NULL, size, g_wl_shm);
+        if (!g_wl_cursor_theme) return;
+        g_wl_cursor_surface = wl_compositor_create_surface(g_wl_compositor);
+        if (!g_wl_cursor_surface) return;
+    }
+
+    struct wl_cursor *c = wl_cursor_theme_get_cursor(g_wl_cursor_theme,
+                                                     "left_ptr");
+    if (!c || !c->image_count)
+        c = wl_cursor_theme_get_cursor(g_wl_cursor_theme, "default");
+    if (!c || !c->image_count) return;
+
+    struct wl_cursor_image *img = c->images[0];
+    wl_surface_attach(g_wl_cursor_surface, wl_cursor_image_get_buffer(img),
+                      0, 0);
+    wl_surface_damage(g_wl_cursor_surface, 0, 0,
+                      (int32_t)img->width, (int32_t)img->height);
+    wl_surface_commit(g_wl_cursor_surface);
+    wl_pointer_set_cursor(pointer, serial, g_wl_cursor_surface,
+                          (int32_t)img->hotspot_x, (int32_t)img->hotspot_y);
+}
+
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy)
 {
-    (void)data; (void)pointer; (void)serial;
+    (void)data;
+    wl_set_cursor(pointer, serial);
     g_pointer_window = (ag_window *)wl_proxy_get_user_data((struct wl_proxy *)surface);
     g_pointer_x = wl_fixed_to_int(sx);
     g_pointer_y = wl_fixed_to_int(sy);
@@ -5190,6 +5220,10 @@ void ag_shutdown(void)
     if (g_wl_seat)     wl_seat_destroy(g_wl_seat);
     if (g_wl_decoration) zxdg_decoration_manager_v1_destroy(g_wl_decoration);
     if (g_wl_wm_base)  xdg_wm_base_destroy(g_wl_wm_base);
+    if (g_wl_cursor_surface) { wl_surface_destroy(g_wl_cursor_surface);
+                               g_wl_cursor_surface = NULL; }
+    if (g_wl_cursor_theme)   { wl_cursor_theme_destroy(g_wl_cursor_theme);
+                               g_wl_cursor_theme = NULL; }
     if (g_wl_shm)      wl_shm_destroy(g_wl_shm);
     if (g_wl_compositor) wl_compositor_destroy(g_wl_compositor);
     if (g_wl_registry) wl_registry_destroy(g_wl_registry);
