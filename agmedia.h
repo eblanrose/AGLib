@@ -59,6 +59,7 @@ void     ag_h264_close(ag_h264 *d);
 int      ag_h264_decode(ag_h264 *d, const unsigned char *data, size_t size,
                         ag_image **out);
 int      ag_h264_flush(ag_h264 *d, ag_image **out);
+int      ag_h264_reset(ag_h264 *d);
 
 typedef struct ag_aac ag_aac;
 

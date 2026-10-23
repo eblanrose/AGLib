@@ -31,6 +31,9 @@ typedef ag_u32 ag_color;
 #define AG_BLUE    AG_RGB(0,0,255)
 #define AG_GRAY    AG_RGB(128,128,128)
 
+#define AG_VIS_NBAR 24
+#define AG_VIS_NFFT 512
+
 typedef struct ag_window  ag_window;
 typedef struct ag_canvas  ag_canvas;
 typedef struct ag_font    ag_font;
@@ -154,11 +157,13 @@ AGAPI void   ag_ui_set_font(ag_ui *ui, ag_font *font);
 AGAPI void   ag_ui_set_theme(ag_ui *ui, const ag_ui_theme *th);
 AGAPI void   ag_ui_set_layout_cb(ag_ui *ui, ag_layout_cb cb, void *ud);
 AGAPI const ag_ui_theme *ag_ui_default_theme(void);
+AGAPI const ag_ui_theme *ag_ui_get_theme(ag_ui *ui);
 AGAPI void   ag_ui_draw(ag_ui *ui);          
 AGAPI int    ag_ui_handle(ag_ui *ui, const ag_event *ev);  
 
 AGAPI ag_widget *ag_ui_add_button (ag_ui *ui, const char *label, int x,int y,int w,int h, ag_widget_cb cb, void *ud);
 AGAPI ag_widget *ag_ui_add_slider (ag_ui *ui, float vmin,float vmax,float value, int x,int y,int w,int h, ag_widget_cb cb, void *ud);
+AGAPI ag_widget *ag_ui_add_button_slider (ag_ui *ui, const char *label, float vmin,float vmax,float value, int x,int y,int w,int h, ag_widget_cb cb, void *ud);
 AGAPI ag_widget *ag_ui_add_toggle (ag_ui *ui, const char *label, int checked, int x,int y, ag_widget_cb cb, void *ud);
 AGAPI ag_widget *ag_ui_add_textbox(ag_ui *ui, int x,int y,int w,int h, ag_widget_cb cb, void *ud);
 AGAPI ag_widget *ag_ui_add_textview(ag_ui *ui, int x,int y,int w,int h);  
@@ -168,12 +173,14 @@ AGAPI void ag_widget_move(ag_widget *wdg, int x, int y);
 AGAPI void ag_widget_set_rect(ag_widget *wdg, int x, int y, int w, int h);  
 AGAPI void ag_widget_get_rect(const ag_widget *wdg, int *x, int *y, int *w, int *h);
 AGAPI void ag_widget_set_callback(ag_widget *wdg, ag_widget_cb cb, void *ud);
+AGAPI void ag_widget_set_theme(ag_widget *wdg, const ag_ui_theme *th);
 
 AGAPI const char *ag_button_label(const ag_widget *wdg);
 AGAPI const char *ag_textbox_text(const ag_widget *wdg);
 AGAPI void        ag_textbox_set_text(ag_widget *wdg, const char *text);
 AGAPI int         ag_textbox_submitted(const ag_widget *wdg); 
 AGAPI float       ag_slider_value(const ag_widget *wdg);
+AGAPI void        ag_slider_set_value(ag_widget *wdg, float value);
 AGAPI int         ag_toggle_checked(const ag_widget *wdg);
 AGAPI void        ag_textview_append(ag_widget *wdg, const char *text); 
 AGAPI const char *ag_textview_text(const ag_widget *wdg);
@@ -244,11 +251,14 @@ AGAPI const char *ag_video_backend_name(const ag_video *v);
 AGAPI void        ag_video_set_playing(ag_video *v, int play);
 AGAPI double      ag_video_clock(ag_video *v);
 AGAPI void        ag_video_set_volume(ag_video *v, double vol);
+AGAPI void        ag_video_set_eq(ag_video *v, float bass_db, float mid_db, float treble_db);
 AGAPI int         ag_video_has_audio(const ag_video *v);
 
 AGAPI ag_widget *ag_ui_add_video(ag_ui *ui, const char *path,
                                   int x, int y, int w, int h,
                                   ag_widget_cb cb, void *ud);
+AGAPI ag_widget *ag_ui_add_visualizer(ag_ui *ui, int x, int y, int w, int h);
+AGAPI void        ag_visualizer_set_video(ag_widget *wdg, ag_video *v);
 AGAPI ag_widget *ag_ui_add_image(ag_ui *ui, const ag_image *img,
                                   int x, int y, int w, int h,
                                   ag_widget_cb cb, void *ud);
@@ -260,11 +270,15 @@ AGAPI int    ag_video_widget_playing(ag_widget *wdg);
 AGAPI void   ag_video_widget_play(ag_widget *wdg, int play);
 AGAPI void   ag_video_widget_seek(ag_widget *wdg, double seconds);
 AGAPI double ag_video_widget_time(const ag_widget *wdg);
+AGAPI ag_video *ag_video_widget_video(ag_widget *wdg);
+AGAPI float ag_video_vis_bar(ag_video *v, int i);
+AGAPI float ag_video_vis_peak(ag_video *v, int i);
 AGAPI const char *ag_video_last_error(void);
 
 AGAPI unsigned long ag_time_ms(void);
 AGAPI const char *ag_gpu_renderer(void);
 AGAPI void ag_sleep_ms(unsigned int ms);
+AGAPI char *ag_download_to_temp(const char *url);
 
 #ifdef __cplusplus
 }

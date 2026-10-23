@@ -148,6 +148,47 @@ void ag_h264_close(ag_h264 *d)
     free(d);
 }
 
+int ag_h264_reset(ag_h264 *d)
+{
+    if (!d) return 0;
+    if (d->dec) {
+        (*d->dec)->Uninitialize(d->dec);
+        SDecodingParam param;
+        memset(&param, 0, sizeof(param));
+        param.uiTargetDqLayer = (unsigned char)-1;
+        param.eEcActiveIdc = ERROR_CON_SLICE_COPY;
+        param.bParseOnly = false;
+        param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
+        if ((*d->dec)->Initialize(d->dec, &param) != 0) {
+            (*d->dec)->Uninitialize(d->dec);
+            WelsDestroyDecoder(d->dec);
+            d->dec = NULL;
+            if (WelsCreateDecoder(&d->dec) != 0 || !d->dec) return 0;
+            if ((*d->dec)->Initialize(d->dec, &param) != 0) return 0;
+        }
+    } else {
+        if (WelsCreateDecoder(&d->dec) != 0 || !d->dec) return 0;
+        SDecodingParam param;
+        memset(&param, 0, sizeof(param));
+        param.uiTargetDqLayer = (unsigned char)-1;
+        param.eEcActiveIdc = ERROR_CON_SLICE_COPY;
+        param.bParseOnly = false;
+        param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
+        if ((*d->dec)->Initialize(d->dec, &param) != 0) return 0;
+    }
+    if (d->sets && d->sets_len > 0) {
+        unsigned char *pdst[4] = { NULL, NULL, NULL, NULL };
+        SBufferInfo info;
+        memset(&info, 0, sizeof(info));
+        (*d->dec)->DecodeFrame2(d->dec, d->sets, (int)d->sets_len, pdst, &info);
+    }
+    d->fed = 1;
+    d->eos = 0;
+    d->w = 0;
+    d->h = 0;
+    return 1;
+}
+
 static const unsigned char *to_annexb(ag_h264 *d, const unsigned char *data,
                                       size_t size, size_t *out_len)
 {

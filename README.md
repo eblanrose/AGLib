@@ -2,7 +2,7 @@
 > AGLib
 
 **it's a Lightweight**
-> 9K SLOC! + 10 MiB! and just a few libs
+> 9K SLOC! + 10 MiB (Win Binary uses )! and just a few libs
 
 **It's Cross-platform**
 > Can work on **UNIX And NT!**
@@ -19,7 +19,6 @@ make            # builds `app` (X11) and `app.exe` (Windows)
 make app        # builds `app` (X11)
 make app.exe    # builds the Windows exe (mingw)
 make wayland    # builds `app-wayland`
-make test       # builds and runs the feature smoke test
 ```
 # Examples
 
@@ -576,14 +575,3 @@ Clear log
 
 Set scroll (-1 = pin to bottom)
 
-# Licenses
-
-Every dependency is a git submodule under `third_party/` and links
-statically — no system packages, no runtime loading. Each keeps its own
-license text next to the sources:
-
-* OpenH264 — BSD-2-Clause, `third_party/openh264/LICENSE`
-* FDK AAC — Fraunhofer FDK AAC license, `third_party/fdk-aac/NOTICE`;
-  that text has to travel with binary redistributions, as it requires
-* minimp3 — CC0; zlib / libpng / libjpeg / nanosvg — permissive, see
-  `third_party/<name>/LICENSE*`

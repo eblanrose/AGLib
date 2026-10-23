@@ -1331,22 +1331,64 @@ ag_image *ag_image_load_svg(const char *path, float scale)
     return im;
 }
 
+char *ag_download_to_temp(const char *url)
+{
+    if (!url) return NULL;
+    int is_url = (strncmp(url, "http://", 7) == 0) ||
+                 (strncmp(url, "https://", 8) == 0);
+    if (!is_url) return NULL;
+
+    system("mkdir -p /tmp/opencode");
+
+    char *path = (char *)malloc(256);
+    if (!path) return NULL;
+    snprintf(path, 256, "/tmp/opencode/ag_asset_%lu", (unsigned long)ag_time_ms());
+
+    char esc[4096];
+    size_t ei = 0;
+    for (const char *p = url; *p && ei < sizeof(esc) - 4; ++p) {
+        if (*p == '\'') {
+            esc[ei++] = '\''; esc[ei++] = '\\';
+            esc[ei++] = '\''; esc[ei++] = '\'';
+        } else esc[ei++] = *p;
+    }
+    esc[ei] = '\0';
+
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd), "curl -sSL -o '%s' '%s' >/dev/null 2>&1", path, esc);
+    if (system(cmd) != 0) {
+        snprintf(cmd, sizeof(cmd), "wget -q -O '%s' '%s' >/dev/null 2>&1", path, esc);
+        if (system(cmd) != 0) { free(path); return NULL; }
+    }
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { free(path); return NULL; }
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fclose(fp);
+    if (sz <= 0) { free(path); return NULL; }
+    return path;
+}
+
 ag_image *ag_image_load(const char *path)
 {
-    if (!path) return NULL;
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
+    char *tmp = ag_download_to_temp(path);
+    const char *use = tmp ? tmp : path;
+    if (!use) { free(tmp); return NULL; }
+
+    FILE *fp = fopen(use, "rb");
+    if (!fp) { free(tmp); return NULL; }
 
     size_t cap = 1 << 20, sz = 0;
     unsigned char *buf = (unsigned char *)malloc(cap);
-    if (!buf) { fclose(fp); return NULL; }
+    if (!buf) { fclose(fp); free(tmp); return NULL; }
     for (;;) {
         size_t got = fread(buf + sz, 1, cap - sz, fp);
         sz += got;
         if (got < cap - sz) break;
         cap *= 2;
         unsigned char *nb = (unsigned char *)realloc(buf, cap);
-        if (!nb) { free(buf); fclose(fp); return NULL; }
+        if (!nb) { free(buf); fclose(fp); free(tmp); return NULL; }
         buf = nb;
     }
     fclose(fp);
@@ -1361,6 +1403,7 @@ ag_image *ag_image_load(const char *path)
     else
         im = ag_image_from_bmp(buf, sz);
     free(buf);
+    free(tmp);
     return im;
 }
 
@@ -1871,11 +1914,13 @@ static const ag_ui_theme ag_default_theme = {
 typedef enum {
     AG_WIDGET_BUTTON_T = 0,
     AG_WIDGET_SLIDER_T,
+    AG_WIDGET_SLIDERBTN_T,
     AG_WIDGET_TOGGLE_T,
     AG_WIDGET_TEXTBOX_T,
     AG_WIDGET_TEXTVIEW_T,
     AG_WIDGET_IMAGE_T,
-    AG_WIDGET_VIDEO_T
+    AG_WIDGET_VIDEO_T,
+    AG_WIDGET_VISUALIZER_T
 } ag_widget_kind;
 
 #define AG_WIDGET_SB_W 12
@@ -1921,9 +1966,12 @@ struct ag_widget {
     int removed;
     int page;
     int anim_delay;
+    int has_th;
+    ag_ui_theme th;
     union {
         struct { char *label; } button;
         struct { float vmin, vmax, val; } slider;
+        struct { float vmin, vmax, val; char *label; } sliderbtn;
         struct { char *label; int on; } toggle;
         struct { char *buf; int cap, len, cursor, submit; } textbox;
         struct { char *buf; int cap, len;
@@ -1955,7 +2003,14 @@ struct ag_widget {
             int       seek_drag;
             double    acc;
             unsigned long last_tick;
+            int       blur_radius;
+            int       blur_passes;
         } video;
+        struct {
+            ag_video *video;
+            float     bars[AG_VIS_NBAR];
+            float     peaks[AG_VIS_NBAR];
+        } visualizer;
     } u;
 };
 
@@ -2023,6 +2078,7 @@ static void ag_ui_gc(ag_ui *ui)
             *pp = cur->next;
             switch (cur->kind) {
             case AG_WIDGET_BUTTON_T: free(cur->u.button.label); break;
+            case AG_WIDGET_SLIDERBTN_T: free(cur->u.sliderbtn.label); break;
             case AG_WIDGET_TOGGLE_T: free(cur->u.toggle.label); break;
             case AG_WIDGET_TEXTBOX_T: free(cur->u.textbox.buf); break;
             case AG_WIDGET_TEXTVIEW_T: free(cur->u.textview.buf); break;
@@ -2081,6 +2137,7 @@ void ag_ui_destroy(ag_ui *ui)
         struct ag_widget *n = ui->head->next;
         switch (ui->head->kind) {
         case AG_WIDGET_BUTTON_T: free(ui->head->u.button.label); break;
+        case AG_WIDGET_SLIDERBTN_T: free(ui->head->u.sliderbtn.label); break;
         case AG_WIDGET_TOGGLE_T: free(ui->head->u.toggle.label); break;
         case AG_WIDGET_TEXTBOX_T: free(ui->head->u.textbox.buf); break;
         case AG_WIDGET_TEXTVIEW_T: free(ui->head->u.textview.buf); break;
@@ -2131,6 +2188,11 @@ void ag_ui_set_theme(ag_ui *ui, const ag_ui_theme *th)
 {
     if (!ui) return;
     if (th) ui->th = *th;
+}
+
+const ag_ui_theme *ag_ui_get_theme(ag_ui *ui)
+{
+    return ui ? &ui->th : NULL;
 }
 
 void ag_ui_set_layout_cb(ag_ui *ui, ag_layout_cb cb, void *ud)
@@ -2336,6 +2398,27 @@ ag_widget *ag_ui_add_slider(ag_ui *ui, float vmin, float vmax, float value,
     return wdg;
 }
 
+ag_widget *ag_ui_add_button_slider(ag_ui *ui, const char *label,
+                                   float vmin, float vmax, float value,
+                                   int x, int y, int w, int h,
+                                   ag_widget_cb cb, void *ud)
+{
+    if (!ui) return NULL;
+    struct ag_widget *wdg = (struct ag_widget *)ag_mem_alloc(sizeof(*wdg));
+    if (!wdg) return NULL;
+    wdg->kind = AG_WIDGET_SLIDERBTN_T;
+    wdg->x = x; wdg->y = y; wdg->w = w; wdg->h = h;
+    wdg->cb = cb; wdg->ud = ud;
+    if (vmax < vmin) { float t = vmin; vmin = vmax; vmax = t; }
+    if (value < vmin) value = vmin;
+    if (value > vmax) value = vmax;
+    wdg->u.sliderbtn.vmin = vmin; wdg->u.sliderbtn.vmax = vmax;
+    wdg->u.sliderbtn.val = value;
+    wdg->u.sliderbtn.label = label ? strdup(label) : NULL;
+    ag_widget_add(ui, wdg);
+    return wdg;
+}
+
 ag_widget *ag_ui_add_toggle(ag_ui *ui, const char *label, int checked,
                             int x, int y, ag_widget_cb cb, void *ud)
 {
@@ -2425,6 +2508,8 @@ ag_widget *ag_ui_add_video(ag_ui *ui, const char *path, int x, int y, int w, int
     wdg->u.video.seek_drag = 0;
     wdg->u.video.acc = 0.0;
     wdg->u.video.last_tick = 0;
+    wdg->u.video.blur_radius = 0;
+    wdg->u.video.blur_passes = 1;
     if (!wdg->u.video.video) {
         const char *e = ag_video_last_error();
         wdg->u.video.err = strdup(e && *e ? e : "видео недоступно");
@@ -2435,12 +2520,40 @@ ag_widget *ag_ui_add_video(ag_ui *ui, const char *path, int x, int y, int w, int
     return wdg;
 }
 
+ag_widget *ag_ui_add_visualizer(ag_ui *ui, int x, int y, int w, int h)
+{
+    if (!ui) return NULL;
+    struct ag_widget *wdg = (struct ag_widget *)ag_mem_alloc(sizeof(*wdg));
+    if (!wdg) return NULL;
+    wdg->kind = AG_WIDGET_VISUALIZER_T;
+    wdg->x = x; wdg->y = y; wdg->w = w; wdg->h = h;
+    wdg->cb = NULL; wdg->ud = NULL;
+    wdg->u.visualizer.video = NULL;
+    for (int i = 0; i < AG_VIS_NBAR; ++i) {
+        wdg->u.visualizer.bars[i] = 0.0f;
+        wdg->u.visualizer.peaks[i] = 0.0f;
+    }
+    ag_widget_add(ui, wdg);
+    return wdg;
+}
+
+void ag_visualizer_set_video(ag_widget *wdg, ag_video *v)
+{
+    if (!wdg || wdg->kind != AG_WIDGET_VISUALIZER_T) return;
+    wdg->u.visualizer.video = v;
+}
+
 void ag_widget_set_blur(ag_widget *wdg, int radius, int passes)
 {
-    if (!wdg || wdg->kind != AG_WIDGET_IMAGE_T) return;
-    wdg->u.image.blur_radius = radius > 0 ? radius : 0;
-    wdg->u.image.blur_passes = passes > 0 ? passes : 1;
-    wdg->u.image.gen++;
+    if (!wdg) return;
+    if (wdg->kind == AG_WIDGET_IMAGE_T) {
+        wdg->u.image.blur_radius = radius > 0 ? radius : 0;
+        wdg->u.image.blur_passes = passes > 0 ? passes : 1;
+        wdg->u.image.gen++;
+    } else if (wdg->kind == AG_WIDGET_VIDEO_T) {
+        wdg->u.video.blur_radius = radius > 0 ? radius : 0;
+        wdg->u.video.blur_passes = passes > 0 ? passes : 1;
+    }
 }
 
 void ag_widget_set_image(ag_widget *wdg, const ag_image *img)
@@ -2488,6 +2601,12 @@ double ag_video_widget_time(const ag_widget *wdg)
     return ag_video_time(wdg->u.video.video);
 }
 
+ag_video *ag_video_widget_video(ag_widget *wdg)
+{
+    if (!wdg || wdg->kind != AG_WIDGET_VIDEO_T) return NULL;
+    return wdg->u.video.video;
+}
+
 void ag_widget_remove(ag_ui *ui, ag_widget *wdg)
 {
     if (!ui || !wdg) return;
@@ -2529,6 +2648,17 @@ void ag_widget_set_callback(ag_widget *wdg, ag_widget_cb cb, void *ud)
 {
     if (!wdg) return;
     wdg->cb = cb; wdg->ud = ud;
+}
+
+void ag_widget_set_theme(ag_widget *wdg, const ag_ui_theme *th)
+{
+    if (!wdg) return;
+    if (th) {
+        wdg->th = *th;
+        wdg->has_th = 1;
+    } else {
+        wdg->has_th = 0;
+    }
 }
 
 static int utf8_prev_boundary(const char *s, int idx)
@@ -2680,8 +2810,24 @@ void ag_textview_set_scroll(ag_widget *wdg, int line)
 
 float ag_slider_value(const ag_widget *wdg)
 {
-    if (!wdg || wdg->kind != AG_WIDGET_SLIDER_T) return 0.0f;
-    return wdg->u.slider.val;
+    if (!wdg) return 0.0f;
+    if (wdg->kind == AG_WIDGET_SLIDER_T)     return wdg->u.slider.val;
+    if (wdg->kind == AG_WIDGET_SLIDERBTN_T)  return wdg->u.sliderbtn.val;
+    return 0.0f;
+}
+
+void ag_slider_set_value(ag_widget *wdg, float value)
+{
+    if (!wdg) return;
+    if (wdg->kind == AG_WIDGET_SLIDER_T) {
+        if (value < wdg->u.slider.vmin) value = wdg->u.slider.vmin;
+        if (value > wdg->u.slider.vmax) value = wdg->u.slider.vmax;
+        wdg->u.slider.val = value;
+    } else if (wdg->kind == AG_WIDGET_SLIDERBTN_T) {
+        if (value < wdg->u.sliderbtn.vmin) value = wdg->u.sliderbtn.vmin;
+        if (value > wdg->u.sliderbtn.vmax) value = wdg->u.sliderbtn.vmax;
+        wdg->u.sliderbtn.val = value;
+    }
 }
 
 int ag_toggle_checked(const ag_widget *wdg)
@@ -2692,27 +2838,82 @@ int ag_toggle_checked(const ag_widget *wdg)
 
 #define UI_THUMB_W 14
 
+static const ag_ui_theme *uiw_th(ag_ui *ui, ag_widget *wdg)
+{
+    return (wdg && wdg->has_th) ? &wdg->th : &ui->th;
+}
+
+static void ui_draw_button_slider(ag_ui *ui, ag_widget *wdg)
+{
+    ag_window *win = ui->win;
+    const ag_ui_theme *ui_th = uiw_th(ui, wdg);
+    float t = 0.0f;
+    if (wdg->u.sliderbtn.vmax > wdg->u.sliderbtn.vmin)
+        t = (wdg->u.sliderbtn.val - wdg->u.sliderbtn.vmin) /
+            (wdg->u.sliderbtn.vmax - wdg->u.sliderbtn.vmin);
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+
+    ag_color bg = wdg->pressed ? ui_th->pressed
+                 : (wdg->hovered ? ui_th->hover : ui_th->bg);
+    ag_set_color(win, bg);
+    ag_fill_round_rect(win, wdg->x, wdg->y, wdg->w, wdg->h, ui_th->radius);
+
+    int pad = 3;
+    int ix = wdg->x + pad, iy = wdg->y + pad;
+    int iw = wdg->w - pad * 2, ih = wdg->h - pad * 2;
+    if (iw > 0 && ih > 0) {
+        int fw = (int)(iw * t);
+        ag_set_color(win, ui_th->track);
+        ag_fill_rect(win, ix, iy, iw, ih);
+        if (fw > 0) {
+            ag_set_color(win, ui_th->accent);
+            ag_fill_rect(win, ix, iy, fw, ih);
+        }
+    }
+
+    if (ui_th->borders) {
+        ag_set_color(win, wdg->focused ? ui_th->accent : ui_th->border);
+        ag_draw_round_rect(win, wdg->x, wdg->y, wdg->w, wdg->h, ui_th->radius);
+    }
+
+    char vbuf[48];
+    snprintf(vbuf, sizeof(vbuf), "%g", (double)wdg->u.sliderbtn.val);
+    char txt[160];
+    if (wdg->u.sliderbtn.label && *wdg->u.sliderbtn.label)
+        snprintf(txt, sizeof(txt), "%s  %s", wdg->u.sliderbtn.label, vbuf);
+    else
+        snprintf(txt, sizeof(txt), "%s", vbuf);
+
+    int tw = ui_text_width(ui, txt);
+    int thh = ui_text_height(ui);
+    ag_set_color(win, ui_th->text);
+    ui_draw_text(ui, wdg->x + (wdg->w - tw) / 2, wdg->y + (wdg->h - thh) / 2, txt);
+}
+
 static void ui_draw_button(ag_ui *ui, ag_widget *wdg)
 {
     ag_window *win = ui->win;
-    ag_color bg = wdg->pressed ? ui->th.pressed : (wdg->hovered ? ui->th.hover : ui->th.bg);
+    const ag_ui_theme *ui_th = uiw_th(ui, wdg);
+    ag_color bg = wdg->pressed ? ui_th->pressed : (wdg->hovered ? ui_th->hover : ui_th->bg);
     ag_set_color(win, bg);
-    ag_fill_round_rect(win, wdg->x, wdg->y, wdg->w, wdg->h, ui->th.radius);
-    if (ui->th.borders) {
-        ag_set_color(win, wdg->focused ? ui->th.accent : ui->th.border);
-        ag_draw_round_rect(win, wdg->x, wdg->y, wdg->w, wdg->h, ui->th.radius);
+    ag_fill_round_rect(win, wdg->x, wdg->y, wdg->w, wdg->h, ui_th->radius);
+    if (ui_th->borders) {
+        ag_set_color(win, wdg->focused ? ui_th->accent : ui_th->border);
+        ag_draw_round_rect(win, wdg->x, wdg->y, wdg->w, wdg->h, ui_th->radius);
     }
 
     const char *lab = wdg->u.button.label;
     int tw = ui_text_width(ui, lab);
     int th = ui_text_height(ui);
-    ag_set_color(win, ui->th.text);
+    ag_set_color(win, ui_th->text);
     ui_draw_text(ui, wdg->x + (wdg->w - tw) / 2, wdg->y + (wdg->h - th) / 2, lab);
 }
 
 static void ui_draw_slider(ag_ui *ui, ag_widget *wdg)
 {
     ag_window *win = ui->win;
+    const ag_ui_theme *ui_th = uiw_th(ui, wdg);
     float t = 0.0f;
     if (wdg->u.slider.vmax > wdg->u.slider.vmin)
         t = (wdg->u.slider.val - wdg->u.slider.vmin) /
@@ -2720,31 +2921,32 @@ static void ui_draw_slider(ag_ui *ui, ag_widget *wdg)
     int tracky = wdg->y + wdg->h / 2 - 2;
     int tw = wdg->w - UI_THUMB_W;
 
-    ag_set_color(win, ui->th.track);
+    ag_set_color(win, ui_th->track);
     ag_fill_rect(win, wdg->x + UI_THUMB_W / 2, tracky, tw, 4);
-    ag_set_color(win, ui->th.accent);
+    ag_set_color(win, ui_th->accent);
     ag_fill_rect(win, wdg->x + UI_THUMB_W / 2, tracky, (int)(tw * t), 4);
 
     int hx = wdg->x + (int)(tw * t);
-    ag_set_color(win, wdg->hovered || wdg->pressed ? ui->th.thumb : AG_RGB(120,120,130));
-    ag_fill_round_rect(win, hx, wdg->y, UI_THUMB_W, wdg->h, ui->th.radius);
-    if (ui->th.borders) {
-        ag_set_color(win, ui->th.border);
-        ag_draw_round_rect(win, hx, wdg->y, UI_THUMB_W, wdg->h, ui->th.radius);
+    ag_set_color(win, wdg->hovered || wdg->pressed ? ui_th->thumb : AG_RGB(120,120,130));
+    ag_fill_round_rect(win, hx, wdg->y, UI_THUMB_W, wdg->h, ui_th->radius);
+    if (ui_th->borders) {
+        ag_set_color(win, ui_th->border);
+        ag_draw_round_rect(win, hx, wdg->y, UI_THUMB_W, wdg->h, ui_th->radius);
     }
 }
 
 static void ui_draw_toggle(ag_ui *ui, ag_widget *wdg)
 {
     ag_window *win = ui->win;
+    const ag_ui_theme *ui_th = uiw_th(ui, wdg);
     int sz = wdg->h - 4;
     int bx = wdg->x + 2, by = wdg->y + 2;
 
-    ag_set_color(win, wdg->u.toggle.on ? ui->th.accent : ui->th.bg2);
-    ag_fill_round_rect(win, bx, by, sz, sz, ui->th.radius);
-    if (ui->th.borders) {
-        ag_set_color(win, wdg->focused ? ui->th.accent : ui->th.border);
-        ag_draw_round_rect(win, bx, by, sz, sz, ui->th.radius);
+    ag_set_color(win, wdg->u.toggle.on ? ui_th->accent : ui_th->bg2);
+    ag_fill_round_rect(win, bx, by, sz, sz, ui_th->radius);
+    if (ui_th->borders) {
+        ag_set_color(win, wdg->focused ? ui_th->accent : ui_th->border);
+        ag_draw_round_rect(win, bx, by, sz, sz, ui_th->radius);
     }
 
     if (wdg->u.toggle.on) {
@@ -2753,29 +2955,30 @@ static void ui_draw_toggle(ag_ui *ui, ag_widget *wdg)
         ag_draw_line(win, bx + sz / 2, by + sz - 5, bx + sz - 4, by + 4);
     }
 
-    ag_set_color(win, ui->th.text);
+    ag_set_color(win, ui_th->text);
     ui_draw_text(ui, bx + sz + 8, by, wdg->u.toggle.label);
 }
 
 static void ui_draw_textbox(ag_ui *ui, ag_widget *wdg)
 {
     ag_window *win = ui->win;
+    const ag_ui_theme *ui_th = uiw_th(ui, wdg);
 if (!ui->font) {
-        ag_set_color(win, ui->th.bg2);
+        ag_set_color(win, ui_th->bg2);
         ag_fill_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
-        if (ui->th.borders) {
-            ag_set_color(win, wdg->focused ? ui->th.accent : ui->th.border);
+        if (ui_th->borders) {
+            ag_set_color(win, wdg->focused ? ui_th->accent : ui_th->border);
             ag_draw_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
         }
-        ag_set_color(win, ui->th.text);
+        ag_set_color(win, ui_th->text);
         ui_draw_text(ui, wdg->x + 4, wdg->y + 3, wdg->u.textbox.buf);
         return;
     }
 
-    ag_set_color(win, ui->th.bg2);
+    ag_set_color(win, ui_th->bg2);
     ag_fill_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
-    if (ui->th.borders) {
-        ag_set_color(win, wdg->focused ? ui->th.accent : ui->th.border);
+    if (ui_th->borders) {
+        ag_set_color(win, wdg->focused ? ui_th->accent : ui_th->border);
         ag_draw_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
     }
 
@@ -2812,7 +3015,7 @@ if (!ui->font) {
     int px = wdg->x + 4, py = wdg->y + (wdg->h - fh) / 2;
     const char *p = txt;
     while ((int)(p - txt) < start && *p) utf8_decode(&p);
-    ag_set_color(win, ui->th.text);
+    ag_set_color(win, ui_th->text);
     while (*p && (int)(p - txt) <= len) {
         const char *q = p;
         ag_u32 cp = utf8_decode(&p);
@@ -2829,7 +3032,7 @@ if (!ui->font) {
     if (wdg->focused) {
         int cx = wdg->x + 4 + caret_x;
         if (cx < wdg->x + wdg->w - 2) {
-            ag_set_color(win, ui->th.accent);
+            ag_set_color(win, ui_th->accent);
             ag_fill_rect(win, cx, py, 1, fh);
         }
     }
@@ -2921,11 +3124,12 @@ static int tv_draw_line(ag_ui *ui, int x, int *py, int text_w,
 static void ui_draw_textview(ag_ui *ui, ag_widget *wdg)
 {
     ag_window *win = ui->win;
+    const ag_ui_theme *ui_th = uiw_th(ui, wdg);
 
-    ag_set_color(win, ui->th.bg2);
+    ag_set_color(win, ui_th->bg2);
     ag_fill_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
-    if (ui->th.borders) {
-        ag_set_color(win, wdg->focused ? ui->th.accent : ui->th.border);
+    if (ui_th->borders) {
+        ag_set_color(win, wdg->focused ? ui_th->accent : ui_th->border);
         ag_draw_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
     }
 
@@ -2954,7 +3158,7 @@ static void ui_draw_textview(ag_ui *ui, ag_widget *wdg)
     wdg->u.textview.pinned = (s >= max_scroll);
 
     ag_clip_set(win, wdg->x + 2, wdg->y + 2, text_w, wdg->h - 4);
-    ag_set_color(win, ui->th.text);
+    ag_set_color(win, ui_th->text);
 
     int py = wdg->y + 2;
     int row = 0, p = 0;
@@ -2979,14 +3183,14 @@ static void ui_draw_textview(ag_ui *ui, ag_widget *wdg)
         int sbx = wdg->x + wdg->w - sb_w;
         int sby = wdg->y + 1, sbh = wdg->h - 2;
         ag_color sb_col = (wdg->hovered || wdg->u.textview.sb_drag)
-                            ? ui->th.scrollbar_hover : ui->th.scrollbar;
+                            ? ui_th->scrollbar_hover : ui_th->scrollbar;
         ag_set_color(win, sb_col);
         ag_fill_rect(win, sbx, sby, sb_w, sbh);
 
         int th2 = sbh * vis / total;
         if (th2 < 8) th2 = sbh > 8 ? 8 : sbh;
         int ty = sby + (max_scroll > 0 ? (sbh - th2) * s / max_scroll : 0);
-        ag_set_color(win, ui->th.thumb);
+        ag_set_color(win, ui_th->thumb);
         ag_fill_rect(win, sbx, ty, sb_w, th2);
     }
 }
@@ -3121,6 +3325,7 @@ static void ui_update_images(ag_ui *ui)
 static void ui_draw_image_card(ag_ui *ui, struct ag_widget *wdg)
 {
     ag_window *win = ui->win;
+    const ag_ui_theme *ui_th = uiw_th(ui, wdg);
     const ag_image *im = wdg->u.image.img;
 
     if (im && im->pixels) {
@@ -3128,7 +3333,7 @@ static void ui_draw_image_card(ag_ui *ui, struct ag_widget *wdg)
         if (!pic) pic = im;
         if (pic) ag_draw_image(win, wdg->x, wdg->y, wdg->w, wdg->h, pic);
     } else {
-        ag_set_color(win, ui->th.bg2);
+        ag_set_color(win, ui_th->bg2);
         ag_fill_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
     }
 
@@ -3146,8 +3351,8 @@ static void ui_draw_image_card(ag_ui *ui, struct ag_widget *wdg)
         ui_draw_text(ui, wdg->x + 6, sy + 3, wdg->u.image.caption);
     }
 
-    if (ui->th.borders) {
-        ag_set_color(win, ui->th.border);
+    if (ui_th->borders) {
+        ag_set_color(win, ui_th->border);
         ag_draw_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
     }
 }
@@ -3183,6 +3388,7 @@ static void ui_video_time_str(char *buf, int cap, double t)
 static void ui_draw_video(ag_ui *ui, struct ag_widget *wdg)
 {
     ag_window *win = ui->win;
+    const ag_ui_theme *ui_th = uiw_th(ui, wdg);
     int bar = wdg->h > UI_VIDEO_BAR * 2 ? UI_VIDEO_BAR : 0;
     int vh = wdg->h - bar;
     if (vh < 1) vh = 1;
@@ -3203,20 +3409,24 @@ static void ui_draw_video(ag_ui *ui, struct ag_widget *wdg)
             if (dh < 1) dh = 1;
             int dx = wdg->x + (wdg->w - dw) / 2;
             int dy = wdg->y + (vh - dh) / 2;
-            ag_draw_image(win, dx, dy, dw, dh, fr);
+            if (wdg->u.video.blur_radius > 0)
+                ag_draw_image_blur(win, dx, dy, dw, dh, fr,
+                                   wdg->u.video.blur_radius, wdg->u.video.blur_passes);
+            else
+                ag_draw_image(win, dx, dy, dw, dh, fr);
         }
     } else if (wdg->u.video.err && *wdg->u.video.err) {
-        ag_set_color(win, ui->th.text);
+        ag_set_color(win, ui_th->text);
         ui_draw_text(ui, wdg->x + 8, wdg->y + 8, wdg->u.video.err);
     }
 
     if (bar > 0) {
         int by = wdg->y + vh;
-        ag_set_color(win, ui->th.bg2);
+        ag_set_color(win, ui_th->bg2);
         ag_fill_rect(win, wdg->x, by, wdg->w, bar);
 
         int bx = wdg->x + 6, byy = by + (bar - 18) / 2;
-        ag_set_color(win, ui->th.accent);
+        ag_set_color(win, ui_th->accent);
         if (wdg->u.video.playing) {
             ag_fill_rect(win, bx, byy, 5, 18);
             ag_fill_rect(win, bx + 9, byy, 5, 18);
@@ -3231,7 +3441,7 @@ static void ui_draw_video(ag_ui *ui, struct ag_widget *wdg)
         int sw = wdg->w - (sx - wdg->x) - 66;
         if (sw > 20) {
             int sy2 = by + bar / 2 - 2;
-            ag_set_color(win, ui->th.track);
+            ag_set_color(win, ui_th->track);
             ag_fill_rect(win, sx, sy2, sw, 4);
             double dur = ag_video_duration(wdg->u.video.video);
             double cur = ag_video_time(wdg->u.video.video);
@@ -3239,7 +3449,7 @@ static void ui_draw_video(ag_ui *ui, struct ag_widget *wdg)
                 int p = (int)(sw * (cur / dur));
                 if (p < 0) p = 0;
                 if (p > sw) p = sw;
-                ag_set_color(win, ui->th.accent);
+                ag_set_color(win, ui_th->accent);
                 ag_fill_rect(win, sx, sy2, p, 4);
                 ag_fill_round_rect(win, sx + p - 3, by + 2, 6, bar - 4, 3);
             }
@@ -3249,14 +3459,14 @@ static void ui_draw_video(ag_ui *ui, struct ag_widget *wdg)
         double cur = ag_video_time(wdg->u.video.video);
         double dur = ag_video_duration(wdg->u.video.video);
         ui_video_time_str(ts, sizeof(ts), cur);
-        ag_set_color(win, ui->th.text);
+        ag_set_color(win, ui_th->text);
         int tw = ui_text_width(ui, ts);
         ui_draw_text(ui, wdg->x + wdg->w - tw - 8, by + (bar - ui_text_height(ui)) / 2, ts);
         (void)dur;
     }
 
-    if (ui->th.borders) {
-        ag_set_color(win, ui->th.border);
+    if (ui_th->borders) {
+        ag_set_color(win, ui_th->border);
         ag_draw_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
     }
 }
@@ -3275,16 +3485,65 @@ static void ui_video_seek_at(ag_widget *wdg, int x)
 }
 
 
+static void ui_draw_visualizer(ag_ui *ui, ag_widget *wdg)
+{
+    ag_window *win = ui->win;
+    const ag_ui_theme *ui_th = uiw_th(ui, wdg);
+
+    ag_set_color(win, AG_RGB(10, 10, 14));
+    ag_fill_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
+
+    ag_video *v = wdg->u.visualizer.video;
+    if (v) {
+        for (int i = 0; i < AG_VIS_NBAR; ++i) {
+            wdg->u.visualizer.bars[i] = ag_video_vis_bar(v, i);
+            wdg->u.visualizer.peaks[i] = ag_video_vis_peak(v, i);
+        }
+    }
+
+    int nbars = AG_VIS_NBAR;
+    int gap = 2;
+    int barw = (wdg->w - (nbars + 1) * gap) / nbars;
+    if (barw < 1) barw = 1;
+    int maxh = wdg->h - 4;
+    for (int i = 0; i < nbars; ++i) {
+        float val = (v) ? wdg->u.visualizer.bars[i] : 0.0f;
+        if (val < 0.0f) val = 0.0f;
+        if (val > 1.0f) val = 1.0f;
+        int bh = (int)(maxh * val);
+        if (bh < 1 && val > 0.01f) bh = 1;
+        int x = wdg->x + gap + i * (barw + gap);
+        int y = wdg->y + wdg->h - 2 - bh;
+        ag_set_color(win, ui_th->accent);
+        ag_fill_rect(win, x, y, barw, bh);
+        if (v) {
+            float pk = wdg->u.visualizer.peaks[i];
+            if (pk > 0.0f && pk <= 1.0f) {
+                int py = wdg->y + wdg->h - 2 - (int)(maxh * pk);
+                ag_set_color(win, ui_th->text);
+                ag_fill_rect(win, x, py, barw, 2);
+            }
+        }
+    }
+
+    if (ui_th->borders) {
+        ag_set_color(win, ui_th->border);
+        ag_draw_rect(win, wdg->x, wdg->y, wdg->w, wdg->h);
+    }
+}
+
 static void ui_draw_widget(ag_ui *ui, struct ag_widget *wdg)
 {
     switch (wdg->kind) {
     case AG_WIDGET_BUTTON_T:  ui_draw_button(ui, wdg); break;
     case AG_WIDGET_SLIDER_T:  ui_draw_slider(ui, wdg); break;
+    case AG_WIDGET_SLIDERBTN_T: ui_draw_button_slider(ui, wdg); break;
     case AG_WIDGET_TOGGLE_T:  ui_draw_toggle(ui, wdg); break;
     case AG_WIDGET_TEXTBOX_T: ui_draw_textbox(ui, wdg); break;
     case AG_WIDGET_TEXTVIEW_T:ui_draw_textview(ui, wdg); break;
     case AG_WIDGET_IMAGE_T:   ui_draw_image_card(ui, wdg); break;
     case AG_WIDGET_VIDEO_T:   ui_draw_video(ui, wdg); break;
+    case AG_WIDGET_VISUALIZER_T: ui_draw_visualizer(ui, wdg); break;
     }
 }
 
@@ -3546,6 +3805,18 @@ int ag_ui_handle(ag_ui *ui, const ag_event *ev)
             return 1;
         }
 
+        if (ui->pressed && ui->pressed->kind == AG_WIDGET_SLIDERBTN_T &&
+            !ui->pressed->removed) {
+            struct ag_widget *s = ui->pressed;
+            float t = s->w > 0 ? (float)(ev->x - s->x) / s->w : 0.0f;
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            s->u.sliderbtn.val = s->u.sliderbtn.vmin +
+                                 t * (s->u.sliderbtn.vmax - s->u.sliderbtn.vmin);
+            if (s->cb) s->cb(s, s->ud);
+            return 1;
+        }
+
         if (ui->pressed && ui->pressed->kind == AG_WIDGET_TEXTVIEW_T &&
             ui->pressed->u.textview.sb_drag && !ui->pressed->removed) {
             ag_widget *tv = ui->pressed;
@@ -3583,6 +3854,14 @@ int ag_ui_handle(ag_ui *ui, const ag_event *ev)
         ui->pressed = h;
         h->focused = 1;
         h->pressed = 1;
+        if (h->kind == AG_WIDGET_SLIDERBTN_T) {
+            float t = h->w > 0 ? (float)(ev->x - h->x) / h->w : 0.0f;
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            h->u.sliderbtn.val = h->u.sliderbtn.vmin +
+                                 t * (h->u.sliderbtn.vmax - h->u.sliderbtn.vmin);
+            if (h->cb) h->cb(h, h->ud);
+        }
         if (h->kind == AG_WIDGET_TEXTVIEW_T &&
             ev->x >= h->x + h->w - AG_WIDGET_SB_W) {
             h->u.textview.sb_drag = 1;
@@ -3632,6 +3911,7 @@ int ag_ui_handle(ag_ui *ui, const ag_event *ev)
                 break;
             default:
                 if (p->cb && (p->kind == AG_WIDGET_SLIDER_T  ||
+                              p->kind == AG_WIDGET_SLIDERBTN_T ||
                               p->kind == AG_WIDGET_IMAGE_T   ||
                               p->kind == AG_WIDGET_VIDEO_T))
                     p->cb(p, p->ud);
@@ -4156,7 +4436,7 @@ void ag_main_loop(void)
     g_running = 1;
     while (g_running) {
         if (!ag_poll_events()) break;
-        ag_sleep_ms(1);
+        ag_sleep_ms(8);
     }
 }
 
@@ -4691,7 +4971,7 @@ void ag_main_loop(void)
     g_running = 1;
     while (g_running) {
         if (!ag_poll_events()) break;
-        ag_sleep_ms(1);
+        ag_sleep_ms(8);
     }
 }
 
@@ -5406,7 +5686,7 @@ void ag_main_loop(void)
     g_running = 1;
     while (g_running) {
         if (!ag_poll_events()) break;
-        ag_sleep_ms(1);
+        ag_sleep_ms(8);
     }
 }
 

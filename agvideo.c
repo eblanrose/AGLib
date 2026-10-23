@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -56,6 +57,20 @@ struct ag_video {
     ag_aout  *aout;
     int       aout_dropped;
     int       gain;
+    float     eq_gain[3];
+    int       eq_enabled;
+    int       eq_fs;
+    float     eq_coef[3][5];
+    float     eq_x1[3][2], eq_x2[3][2];
+    float     eq_y1[3][2], eq_y2[3][2];
+    int       eq_state_valid;
+    float     vis_bars[AG_VIS_NBAR];
+    float     vis_peaks[AG_VIS_NBAR];
+    short     vis_pcm[AG_VIS_NFFT];
+    float     vis_re[AG_VIS_NFFT];
+    float     vis_im[AG_VIS_NFFT];
+    int       vis_pcm_pos;
+    int       vis_pcm_n;
     short    *pcm;
 
     ag_mutex *lk;
@@ -65,6 +80,7 @@ struct ag_video {
     double    wall0;
     double    seek_target;
     double    discard_until;
+    int       seek_keyframe;
 
     struct { ag_image *img; double pts; } fq[AG_FQ_CAP];
     int fq_h, fq_n;
@@ -351,6 +367,11 @@ static void accept_video_frame(ag_video *v, ag_image *im, double pts)
 {
     if (!im) return;
     if (v->discard_until >= 0.0 && pts + 1e-6 < v->discard_until) {
+        if (v->seek_keyframe) {
+            v->seek_keyframe = 0;
+            fq_push(v, im, v->discard_until);
+            return;
+        }
         ag_image_destroy(im);
         return;
     }
@@ -370,9 +391,175 @@ static void drain_video(ag_video *v, int discard)
     }
 }
 
+static void eq_update(ag_video *v, int fs)
+{
+    if (!v || fs <= 0) return;
+    static const float fc[3] = { 120.0f, 1000.0f, 6000.0f };
+    const float Q = 1.0f;
+    for (int b = 0; b < 3; ++b) {
+        float gain_db = v->eq_gain[b];
+        float A = powf(10.0f, gain_db / 40.0f);
+        float w0 = 2.0f * 3.14159265f * fc[b] / (float)fs;
+        float cosw = cosf(w0);
+        float sinw = sinf(w0);
+        float alpha = sinw / (2.0f * Q);
+        float b0 = 1.0f + alpha * A;
+        float b1 = -2.0f * cosw;
+        float b2 = 1.0f - alpha * A;
+        float a0 = 1.0f + alpha / A;
+        float a1 = -2.0f * cosw;
+        float a2 = 1.0f - alpha / A;
+        v->eq_coef[b][0] = b0 / a0;
+        v->eq_coef[b][1] = b1 / a0;
+        v->eq_coef[b][2] = b2 / a0;
+        v->eq_coef[b][3] = a1 / a0;
+        v->eq_coef[b][4] = a2 / a0;
+    }
+    for (int b = 0; b < 3; ++b)
+        for (int ch = 0; ch < 2; ++ch) {
+            v->eq_x1[b][ch] = v->eq_x2[b][ch] = 0.0f;
+            v->eq_y1[b][ch] = v->eq_y2[b][ch] = 0.0f;
+        }
+    v->eq_fs = fs;
+    v->eq_state_valid = 1;
+}
+
+static void eq_process(ag_video *v, short *pcm, int n, int channels)
+{
+    if (!v || !pcm || n <= 0 || channels < 1 || channels > 2) return;
+    if (n * channels > AG_PCM_MAX * AG_PCM_CH_MAX) return;
+    if (!v->eq_enabled) return;
+    int any = 0;
+    for (int b = 0; b < 3; ++b) if (fabsf(v->eq_gain[b]) > 0.01f) any = 1;
+    if (!any) return;
+    if (v->arate <= 0) return;
+    if (!v->eq_state_valid || v->eq_fs != v->arate) eq_update(v, v->arate);
+
+    for (int i = 0; i < n; ++i) {
+        for (int ch = 0; ch < channels; ++ch) {
+            float x = (float)pcm[i * channels + ch];
+            for (int b = 0; b < 3; ++b) {
+                float *c = v->eq_coef[b];
+                float y = c[0] * x + c[1] * v->eq_x1[b][ch] +
+                          c[2] * v->eq_x2[b][ch] - c[3] * v->eq_y1[b][ch] -
+                          c[4] * v->eq_y2[b][ch];
+                v->eq_x2[b][ch] = v->eq_x1[b][ch];
+                v->eq_x1[b][ch] = x;
+                v->eq_y2[b][ch] = v->eq_y1[b][ch];
+                v->eq_y1[b][ch] = y;
+                x = y;
+            }
+            if (x > 32767.0f) x = 32767.0f;
+            if (x < -32768.0f) x = -32768.0f;
+            pcm[i * channels + ch] = (short)x;
+        }
+    }
+}
+
+void ag_video_set_eq(ag_video *v, float bass_db, float mid_db, float treble_db)
+{
+    if (!v) return;
+    v->eq_gain[0] = bass_db;
+    v->eq_gain[1] = mid_db;
+    v->eq_gain[2] = treble_db;
+    v->eq_enabled = 1;
+    v->eq_state_valid = 0;
+}
+
+float ag_video_vis_bar(ag_video *v, int i)
+{
+    if (!v || i < 0 || i >= AG_VIS_NBAR) return 0.0f;
+    if (v->lk) ag_mutex_lock(v->lk);
+    float val = v->vis_bars[i];
+    if (v->lk) ag_mutex_unlock(v->lk);
+    return val;
+}
+
+float ag_video_vis_peak(ag_video *v, int i)
+{
+    if (!v || i < 0 || i >= AG_VIS_NBAR) return 0.0f;
+    if (v->lk) ag_mutex_lock(v->lk);
+    float val = v->vis_peaks[i];
+    if (v->lk) ag_mutex_unlock(v->lk);
+    return val;
+}
+
+static void vis_compute(ag_video *v)
+{
+    int start = (v->vis_pcm_pos - AG_VIS_NFFT + AG_VIS_NFFT) % AG_VIS_NFFT;
+    for (int i = 0; i < AG_VIS_NFFT; ++i) {
+        int idx = (start + i) % AG_VIS_NFFT;
+        float s = (float)v->vis_pcm[idx] / 32768.0f;
+        float w = 0.5f * (1.0f - cosf(2.0f * 3.14159265f * (float)i /
+                                       (float)(AG_VIS_NFFT - 1)));
+        v->vis_re[i] = s * w;
+        v->vis_im[i] = 0.0f;
+    }
+    int j = 0;
+    for (int i = 1; i < AG_VIS_NFFT; ++i) {
+        int bit = AG_VIS_NFFT >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            float tr = v->vis_re[i]; v->vis_re[i] = v->vis_re[j]; v->vis_re[j] = tr;
+            float ti = v->vis_im[i]; v->vis_im[i] = v->vis_im[j]; v->vis_im[j] = ti;
+        }
+    }
+    for (int len = 2; len <= AG_VIS_NFFT; len <<= 1) {
+        float ang = -2.0f * 3.14159265f / (float)len;
+        float wlen_re = cosf(ang), wlen_im = sinf(ang);
+        for (int i = 0; i < AG_VIS_NFFT; i += len) {
+            float w_re = 1.0f, w_im = 0.0f;
+            for (int k = 0; k < len / 2; ++k) {
+                float u_re = v->vis_re[i + k], u_im = v->vis_im[i + k];
+                float v_re = v->vis_re[i + k + len / 2] * w_re -
+                             v->vis_im[i + k + len / 2] * w_im;
+                float v_im = v->vis_re[i + k + len / 2] * w_im +
+                             v->vis_im[i + k + len / 2] * w_re;
+                v->vis_re[i + k] = u_re + v_re;
+                v->vis_im[i + k] = u_im + v_im;
+                v->vis_re[i + k + len / 2] = u_re - v_re;
+                v->vis_im[i + k + len / 2] = u_im - v_im;
+                float nw_re = w_re * wlen_re - w_im * wlen_im;
+                float nw_im = w_re * wlen_im + w_im * wlen_re;
+                w_re = nw_re; w_im = nw_im;
+            }
+        }
+    }
+    float newbars[AG_VIS_NBAR];
+    for (int b = 0; b < AG_VIS_NBAR; ++b) newbars[b] = 0.0f;
+    int nbins = AG_VIS_NFFT / 2;
+    for (int k = 1; k < nbins; ++k) {
+        float mag = sqrtf(v->vis_re[k] * v->vis_re[k] + v->vis_im[k] * v->vis_im[k]);
+        float logk = logf((float)(k + 1)) / logf((float)(nbins + 1));
+        int bar = (int)(logk * (float)AG_VIS_NBAR);
+        if (bar < 0) bar = 0;
+        if (bar >= AG_VIS_NBAR) bar = AG_VIS_NBAR - 1;
+        newbars[bar] += mag;
+    }
+    float mx = 1e-9f;
+    for (int b = 0; b < AG_VIS_NBAR; ++b) if (newbars[b] > mx) mx = newbars[b];
+    for (int b = 0; b < AG_VIS_NBAR; ++b) {
+        float val = newbars[b] / mx;
+        v->vis_bars[b] = v->vis_bars[b] * 0.6f + val * 0.4f;
+        if (v->vis_bars[b] > v->vis_peaks[b])
+            v->vis_peaks[b] = v->vis_bars[b];
+        else
+            v->vis_peaks[b] *= 0.97f;
+    }
+}
+
 static void apply_seek(ag_video *v, double target)
 {
     drain_video(v, 1);
+    if (v->h264) ag_h264_reset(v->h264);
+    v->eq_state_valid = 0;
+    v->vis_pcm_n = 0;
+    v->vis_pcm_pos = 0;
+    for (int i = 0; i < AG_VIS_NBAR; ++i) {
+        v->vis_bars[i] = 0.0f;
+        v->vis_peaks[i] = 0.0f;
+    }
     v->dmx->seek(v->dmx->self, 0, target);
     v->dmx->seek(v->dmx->self, 1, target);
     if (v->acodec == AG_ACODEC_AAC && v->adec)
@@ -384,6 +571,7 @@ static void apply_seek(ag_video *v, double target)
     if (v->aout) ag_aout_set_clock(v->aout, target);
     else v->wall0 = ag_video_now() - target;
     v->discard_until = target;
+    v->seek_keyframe = 1;
     v->eof = 0;
     v->seek_pending = 0;
 }
@@ -464,6 +652,23 @@ static void media_thread(void *ud)
                         int total = n * v->achan;
                         for (int i = 0; i < total; ++i)
                             v->pcm[i] = (short)((v->pcm[i] * gain) >> 8);
+                    }
+
+                    eq_process(v, v->pcm, n, v->achan);
+
+                    for (int i = 0; i < n; ++i) {
+                        float s = 0.0f;
+                        for (int ch = 0; ch < v->achan; ++ch)
+                            s += (float)v->pcm[i * v->achan + ch];
+                        s /= (float)v->achan;
+                        v->vis_pcm[v->vis_pcm_pos] = (short)s;
+                        v->vis_pcm_pos = (v->vis_pcm_pos + 1) % AG_VIS_NFFT;
+                        if (v->vis_pcm_n < AG_VIS_NFFT) v->vis_pcm_n++;
+                    }
+                    if (v->vis_pcm_n >= AG_VIS_NFFT) {
+                        if (v->lk) ag_mutex_lock(v->lk);
+                        vis_compute(v);
+                        if (v->lk) ag_mutex_unlock(v->lk);
                     }
 
                     ag_mutex_lock(v->lk);
@@ -595,6 +800,7 @@ static int open_media(ag_video *v, ag_demux *dmx, char *err, int errcap)
 {
     v->dmx = dmx;
     v->gain = 256;
+    v->eq_enabled = 1;
     v->discard_until = -1.0;
 
     int w = 0, h = 0;
@@ -721,7 +927,7 @@ ag_video *ag_video_open_ex(const char *path, ag_video_backend backend)
         }
         v->backend = backend;
         if (!open_media(v, dmx, v->err, (int)sizeof(v->err))) {
-            dmx->close(dmx->self);
+            close_media(v);
             ag_video_seterr(v->err[0] ? v->err : "не удалось открыть видео");
             free(v);
             return NULL;
@@ -765,7 +971,11 @@ ag_video *ag_video_open_ex(const char *path, ag_video_backend backend)
 
 ag_video *ag_video_open(const char *path)
 {
-    return ag_video_open_ex(path, AG_VIDEO_BACKEND_AUTO);
+    char *tmp = ag_download_to_temp(path);
+    const char *use = tmp ? tmp : path;
+    ag_video *v = ag_video_open_ex(use, AG_VIDEO_BACKEND_AUTO);
+    free(tmp);
+    return v;
 }
 
 void ag_video_close(ag_video *v)
@@ -932,7 +1142,7 @@ int ag_video_next_frame(ag_video *v, ag_image **out)
 
     while (v->thr && (v->busy || v->seek_pending)) {
         ag_mutex_unlock(v->lk);
-        ag_video_msleep(1);
+        ag_video_msleep(4);
         ag_mutex_lock(v->lk);
     }
     int r = pull_media_frame(v, out);
@@ -972,7 +1182,7 @@ int ag_video_seek(ag_video *v, double seconds)
 
     while (v->seek_pending && v->run) {
         ag_mutex_unlock(v->lk);
-        ag_video_msleep(1);
+        ag_video_msleep(4);
         ag_mutex_lock(v->lk);
     }
     int ok = !v->seek_pending;

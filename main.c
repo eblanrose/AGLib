@@ -31,7 +31,9 @@ static ag_widget *g_log, *g_info, *g_console;
 static ag_widget *g_btn_tab[4];
 static ag_widget *g_btn_theme, *g_btn_clear, *g_btn_exit;
 static ag_widget *g_sl_font, *g_tgl_borders, *g_sl_c[3];
-static ag_widget *g_sl_blur, *g_btn_anim;
+static ag_widget *g_sl_blur, *g_btn_anim, *g_slb_anim;
+static ag_widget *g_sl_eq[3], *g_tgl_vblur;
+static ag_widget *g_vis;
 static ag_widget *g_card[PHOTO_CARDS];
 static ag_widget *g_video;
 static ag_widget *g_video_mp4;
@@ -52,6 +54,7 @@ static const char *g_anim_names[] = {
     "сдвиг снизу", "сдвиг сверху", "масштаб", "флип"
 };
 static int g_anim_idx = 1;
+static int g_anim_ms = 320;
 
 static void log_line(const char *tag, const char *msg);
 
@@ -91,6 +94,15 @@ static void apply_theme(void)
     th.text    = (r * 299 + g * 587 + b * 114) > 140000
                  ? AG_RGB(20, 24, 32) : AG_RGB(222, 222, 222);
     ag_ui_set_theme(g_ui, &th);
+}
+
+static void apply_exit_style(void)
+{
+    ag_ui_theme t = *ag_ui_get_theme(g_ui);
+    t.accent   = AG_RGB(224, 82, 82);
+    t.accent_d = AG_RGB(170, 52, 52);
+    t.border   = AG_RGB(150, 74, 84);
+    ag_widget_set_theme(g_btn_exit, &t);
 }
 
 static int apply_font_px(int px)
@@ -167,6 +179,9 @@ static void on_layout(ag_ui *ui, int w, int h, void *ud)
     ag_widget_set_rect(g_sl_c[0],     g_main_x, g_main_y + 170, sw, 24);
     ag_widget_set_rect(g_sl_c[1],     g_main_x, g_main_y + 210, sw, 24);
     ag_widget_set_rect(g_sl_c[2],     g_main_x, g_main_y + 250, sw, 24);
+    ag_widget_set_rect(g_slb_anim,    g_main_x, g_main_y + 300, g_main_w, 32);
+    ag_widget_set_rect(g_tgl_vblur,   g_main_x, g_main_y + 340, g_main_w, 24);
+    ag_widget_set_rect(g_vis,         g_main_x, g_main_y + 380, g_main_w, 120);
 }
 
 static void log_line(const char *tag, const char *msg)
@@ -253,10 +268,27 @@ static void on_anim(ag_widget *wdg, void *ud)
 {
     (void)wdg; (void)ud;
     g_anim_idx = (g_anim_idx + 1) % (int)(sizeof(g_anim_types) / sizeof(g_anim_types[0]));
-    ag_ui_set_transition(g_ui, g_anim_types[g_anim_idx], 320, AG_EASE_IN_OUT_CUBIC);
+    ag_ui_set_transition(g_ui, g_anim_types[g_anim_idx], g_anim_ms, AG_EASE_IN_OUT_CUBIC);
     char m[96];
     snprintf(m, sizeof(m), "анимация: %s", g_anim_names[g_anim_idx]);
     log_line("ui", m);
+}
+
+static void on_anim_ms(ag_widget *wdg, void *ud)
+{
+    (void)ud;
+    g_anim_ms = (int)ag_slider_value(wdg);
+    ag_ui_set_transition(g_ui, g_anim_types[g_anim_idx], g_anim_ms, AG_EASE_IN_OUT_CUBIC);
+}
+
+static void on_vblur(ag_widget *wdg, void *ud)
+{
+    (void)ud;
+    if (!g_video) return;
+    if (ag_toggle_checked(wdg))
+        ag_widget_set_blur(g_video, 6, 1);
+    else
+        ag_widget_set_blur(g_video, 0, 1);
 }
 
 static void on_card(ag_widget *wdg, void *ud)
@@ -316,6 +348,7 @@ static void draw_page(ag_ui *ui, int page, void *ud)
         ag_draw_text(w, lx, g_main_y + 174, "цвет R");
         ag_draw_text(w, lx, g_main_y + 214, "G");
         ag_draw_text(w, lx, g_main_y + 254, "B");
+        ag_draw_text(w, lx, g_main_y + 384, "визуализатор");
     }
 }
 
@@ -363,7 +396,7 @@ int main(void)
 
     g_ui = ag_ui_create(g_win);
     apply_theme();
-    ag_ui_set_transition(g_ui, AG_ANIM_SLIDE_LEFT, 320, AG_EASE_IN_OUT_CUBIC);
+    ag_ui_set_transition(g_ui, AG_ANIM_SLIDE_LEFT, g_anim_ms, AG_EASE_IN_OUT_CUBIC);
     ag_ui_set_page_draw_cb(g_ui, draw_page, NULL);
 
     g_btn_tab[0] = ag_ui_add_button(g_ui, "Лог", 0, 0, 0, 0, on_tab, (void *)(intptr_t)PAGE_LOG);
@@ -421,6 +454,12 @@ int main(void)
                                  0, 0, 0, 0, on_col, (void *)(intptr_t)1);
     g_sl_c[2] = ag_ui_add_slider(g_ui, 0.0f, 255.0f, (float)g_main_c[2],
                                  0, 0, 0, 0, on_col, (void *)(intptr_t)2);
+    g_slb_anim = ag_ui_add_button_slider(g_ui, "Длительность анимации",
+                                         100.0f, 800.0f, (float)g_anim_ms,
+                                         0, 0, 0, 0, on_anim_ms, NULL);
+    g_tgl_vblur = ag_ui_add_toggle(g_ui, "Блюр видео", 0, 0, 0, on_vblur, NULL);
+    g_vis = ag_ui_add_visualizer(g_ui, 0, 0, 0, 0);
+    if (g_video) ag_visualizer_set_video(g_vis, ag_video_widget_video(g_video));
 
     ag_widget_set_page(g_btn_tab[0], -1);
     ag_widget_set_page(g_btn_tab[1], -1);
@@ -445,6 +484,11 @@ int main(void)
     ag_widget_set_page(g_sl_c[0], PAGE_SETUP);
     ag_widget_set_page(g_sl_c[1], PAGE_SETUP);
     ag_widget_set_page(g_sl_c[2], PAGE_SETUP);
+    ag_widget_set_page(g_slb_anim, PAGE_SETUP);
+    ag_widget_set_page(g_tgl_vblur, PAGE_SETUP);
+    ag_widget_set_page(g_vis, PAGE_SETUP);
+
+    apply_exit_style();
 
     ag_ui_set_layout_cb(g_ui, on_layout, NULL);
     on_layout(g_ui, g_win_w, g_win_h, NULL);
